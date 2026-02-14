@@ -1,0 +1,38 @@
+[
+  {
+    "id": "wifi_king",
+    "name": "Король с Wi‑Fi",
+    "tier": "S",
+    "rating": 9.2,
+    "tags": [
+      "связь",
+      "мем",
+      "тролль"
+    ],
+    "asset": "assets/wifi_king.ppm"
+  },
+  {
+    "id": "skeleton_bulb",
+    "name": "Скелет с лампочкой",
+    "tier": "C",
+    "rating": 4.5,
+    "tags": [
+      "скелет",
+      "юмор",
+      "смех"
+    ],
+    "asset": "assets/skeleton_bulb.ppm"
+  },
+  {
+    "id": "miner",
+    "name": "Шахтёр",
+    "tier": "A",
+    "rating": 7.0,
+    "tags": [
+      "шахта",
+      "работяга",
+      "брут"
+    ],
+    "asset": "assets/miner.ppm"
+  }
+]
