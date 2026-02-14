@@ -80,8 +80,16 @@ def draw_tier_set(tiers: dict[str, Sequence[dict]], assets_dir: Path, output_dir
     return paths
 
 
-def draw_top_preview(emotes: Sequence[dict], assets_dir: Path, output_path: Path, max_items: int = 140) -> Path:
-    preview_items = list(emotes[:max_items])
+def draw_top_preview(
+    emotes: Sequence[dict],
+    assets_dir: Path,
+    output_path: Path,
+    max_items: int = 140,
+    start_index: int = 0,
+    page_index: int = 1,
+    total_pages: int = 1,
+) -> Path:
+    preview_items = list(emotes[start_index : start_index + max_items])
     columns = max(1, (CANVAS_WIDTH - GRID_PADDING_X * 2) // (ICON_SIZE + 20))
     rows = max(1, (len(preview_items) + columns - 1) // columns)
     canvas_height = HEADER_HEIGHT + GRID_PADDING_Y * 2 + rows * CELL_HEIGHT
@@ -91,7 +99,7 @@ def draw_top_preview(emotes: Sequence[dict], assets_dir: Path, output_path: Path
     title_font = _load_font(30)
     rating_font = _load_font(16)
 
-    title = "TOP preview (быстрый режим)"
+    title = f"TOP preview: страница {page_index}/{total_pages}"
     draw.rectangle((0, 0, CANVAS_WIDTH, HEADER_HEIGHT), fill=(66, 96, 171))
     draw.text((24, 18), title, fill=(245, 245, 245), font=title_font)
 

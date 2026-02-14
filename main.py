@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import random
 import time
@@ -25,6 +26,7 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "database.db"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_UPDATE_MINUTES = int(os.getenv("CACHE_UPDATE_MINUTES", "30"))
 CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID", "0"))
+TOP_ITEMS_PER_PAGE = int(os.getenv("TOP_ITEMS_PER_PAGE", "140"))
 
 MAX_UPDATES_PER_USER_WINDOW = int(os.getenv("MAX_UPDATES_PER_USER_WINDOW", "12"))
 RATE_WINDOW_SECONDS = int(os.getenv("RATE_WINDOW_SECONDS", "10"))
@@ -43,6 +45,9 @@ class TierCache:
     skipped_regenerations: int = 0
     preview_file_id: str | None = None
     preview_path: Path | None = None
+    preview_page_file_ids: list[str] = field(default_factory=list)
+    preview_page_paths: list[Path] = field(default_factory=list)
+    total_emotes: int = 0
 
 
 class RateLimiter:
@@ -187,7 +192,7 @@ class EmojiRatingBot:
         total_votes = await self.fetch_total_votes()
 
         async with self.cache_lock:
-            has_cache = bool(self.cache.preview_file_id or self.cache.preview_path)
+            has_cache = bool(self.cache.preview_page_file_ids or self.cache.preview_page_paths)
             unchanged = has_cache and total_votes == self.last_known_total_votes
             if unchanged:
                 now = datetime.now()
@@ -210,26 +215,43 @@ class EmojiRatingBot:
             else:
                 tiers["C"].append(emote)
 
-        # Тяжелые полные tier-картинки генерируем, но не рассылаем пользователям напрямую.
         tier_paths_map = await asyncio.to_thread(draw_tier_set, tiers, ASSETS_DIR, CACHE_DIR)
         ordered_paths = [tier_paths_map[key] for key in ("S", "A", "B", "C")]
 
-        # Легкая превью-картинка TOP для мгновенного /top
-        preview_path = await asyncio.to_thread(draw_top_preview, emotes, ASSETS_DIR, CACHE_DIR / "top_preview.jpg")
+        total_emotes = len(emotes)
+        pages_count = max(1, math.ceil(total_emotes / TOP_ITEMS_PER_PAGE))
+        page_paths: list[Path] = []
+        for page_idx in range(pages_count):
+            start = page_idx * TOP_ITEMS_PER_PAGE
+            page_path = await asyncio.to_thread(
+                draw_top_preview,
+                emotes,
+                ASSETS_DIR,
+                CACHE_DIR / f"top_preview_{page_idx + 1}.jpg",
+                TOP_ITEMS_PER_PAGE,
+                start,
+                page_idx + 1,
+                pages_count,
+            )
+            page_paths.append(page_path)
 
-        preview_file_id: str | None = None
+        page_file_ids: list[str] = []
         if CACHE_CHAT_ID:
-            async with self.global_send_semaphore:
-                sent = await self.bot.send_photo(chat_id=CACHE_CHAT_ID, photo=FSInputFile(preview_path))
-            if sent.photo:
-                preview_file_id = sent.photo[-1].file_id
+            for page_path in page_paths:
+                async with self.global_send_semaphore:
+                    sent = await self.bot.send_photo(chat_id=CACHE_CHAT_ID, photo=FSInputFile(page_path))
+                if sent.photo:
+                    page_file_ids.append(sent.photo[-1].file_id)
 
         async with self.cache_lock:
             self.cache.local_paths = ordered_paths
             self.cache.file_ids = []
-            self.cache.preview_path = preview_path
-            self.cache.preview_file_id = preview_file_id
+            self.cache.preview_page_paths = page_paths
+            self.cache.preview_page_file_ids = page_file_ids
+            self.cache.preview_path = page_paths[0] if page_paths else None
+            self.cache.preview_file_id = page_file_ids[0] if page_file_ids else None
             self.cache.total_votes = total_votes
+            self.cache.total_emotes = total_emotes
             self.cache.generated_at = datetime.now()
             self.cache.next_update_at = self.cache.generated_at + timedelta(minutes=CACHE_UPDATE_MINUTES)
             self.last_known_total_votes = total_votes
@@ -248,13 +270,52 @@ router = Router()
 service: EmojiRatingBot | None = None
 
 
+def _build_top_caption(cache_snapshot: TierCache, page: int, total_pages: int) -> str:
+    generated = cache_snapshot.generated_at.strftime("%H:%M") if cache_snapshot.generated_at else "-"
+    next_update = cache_snapshot.next_update_at.strftime("%H:%M") if cache_snapshot.next_update_at else "-"
+    start_index = (page - 1) * TOP_ITEMS_PER_PAGE + 1
+    end_index = min(page * TOP_ITEMS_PER_PAGE, cache_snapshot.total_emotes)
+
+    return (
+        "🏆 Текущий рейтинг эмодзи (быстрое превью)\n"
+        f"📄 Страница: {page}/{total_pages} (позиции {start_index}-{end_index})\n"
+        f"🔄 Данные обновляются раз в {CACHE_UPDATE_MINUTES} минут.\n"
+        f"🕒 Последнее обновление: {generated}\n"
+        f"⏳ Следующее обновление: {next_update}\n\n"
+        f"Всего голосов в базе: {cache_snapshot.total_votes}\n"
+        f"⚡ Пропущено пересборок без новых голосов: {cache_snapshot.skipped_regenerations}"
+    )
+
+
+def _top_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if page > 1:
+        kb.add(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"top_page:{page - 1}"))
+    if page < total_pages:
+        kb.add(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"top_page:{page + 1}"))
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+def _parse_top_page(text: str | None) -> int:
+    if not text:
+        return 1
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return 1
+    try:
+        return max(1, int(parts[1]))
+    except ValueError:
+        return 1
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Я бот рейтинга эмодзи Clash Royale.\n"
         "Команды:\n"
         "/vote — оценить случайный эмодзи\n"
-        "/top — быстрый топ-превью рейтинг"
+        "/top [страница] — быстрый топ-превью рейтинг"
     )
 
 
@@ -303,6 +364,8 @@ async def cmd_top(message: Message) -> None:
         await message.answer("/top сейчас вызывается слишком часто. Подождите немного.")
         return
 
+    requested_page = _parse_top_page(message.text)
+
     async with service.cache_lock:
         cache_snapshot = TierCache(
             file_ids=list(service.cache.file_ids),
@@ -313,32 +376,83 @@ async def cmd_top(message: Message) -> None:
             skipped_regenerations=service.cache.skipped_regenerations,
             preview_file_id=service.cache.preview_file_id,
             preview_path=service.cache.preview_path,
+            preview_page_file_ids=list(service.cache.preview_page_file_ids),
+            preview_page_paths=list(service.cache.preview_page_paths),
+            total_emotes=service.cache.total_emotes,
         )
 
-    if not cache_snapshot.preview_file_id and not cache_snapshot.preview_path:
+    if not cache_snapshot.preview_page_file_ids and not cache_snapshot.preview_page_paths:
         await message.answer("Рейтинг еще не готов, попробуйте через минуту.")
         return
 
-    generated = cache_snapshot.generated_at.strftime("%H:%M") if cache_snapshot.generated_at else "-"
-    next_update = cache_snapshot.next_update_at.strftime("%H:%M") if cache_snapshot.next_update_at else "-"
-
-    caption = (
-        "🏆 Текущий рейтинг эмодзи (быстрое превью)\n"
-        f"🔄 Данные обновляются раз в {CACHE_UPDATE_MINUTES} минут.\n"
-        f"🕒 Последнее обновление: {generated}\n"
-        f"⏳ Следующее обновление: {next_update}\n\n"
-        f"Всего голосов в базе: {cache_snapshot.total_votes}\n"
-        f"⚡ Пропущено пересборок без новых голосов: {cache_snapshot.skipped_regenerations}"
-    )
+    total_pages = max(1, len(cache_snapshot.preview_page_paths) or len(cache_snapshot.preview_page_file_ids))
+    page = min(max(1, requested_page), total_pages)
+    page_idx = page - 1
 
     photo: str | FSInputFile
-    if cache_snapshot.preview_file_id:
-        photo = cache_snapshot.preview_file_id
+    if page_idx < len(cache_snapshot.preview_page_file_ids):
+        photo = cache_snapshot.preview_page_file_ids[page_idx]
     else:
-        photo = FSInputFile(cache_snapshot.preview_path)
+        photo = FSInputFile(cache_snapshot.preview_page_paths[page_idx])
+
+    caption = _build_top_caption(cache_snapshot, page, total_pages)
+    reply_markup = _top_keyboard(page, total_pages)
 
     async with service.global_send_semaphore:
-        await message.answer_photo(photo=photo, caption=caption)
+        await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
+
+
+@router.callback_query(F.data.startswith("top_page:"))
+async def on_top_page(callback: CallbackQuery) -> None:
+    if not service or not callback.message:
+        return
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    if not service.top_rate_limiter.allow(user_id):
+        await callback.answer("Слишком часто. Подождите немного.", show_alert=False)
+        return
+
+    try:
+        page = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная страница", show_alert=False)
+        return
+
+    async with service.cache_lock:
+        cache_snapshot = TierCache(
+            file_ids=list(service.cache.file_ids),
+            local_paths=list(service.cache.local_paths),
+            generated_at=service.cache.generated_at,
+            next_update_at=service.cache.next_update_at,
+            total_votes=service.cache.total_votes,
+            skipped_regenerations=service.cache.skipped_regenerations,
+            preview_file_id=service.cache.preview_file_id,
+            preview_path=service.cache.preview_path,
+            preview_page_file_ids=list(service.cache.preview_page_file_ids),
+            preview_page_paths=list(service.cache.preview_page_paths),
+            total_emotes=service.cache.total_emotes,
+        )
+
+    total_pages = max(1, len(cache_snapshot.preview_page_paths) or len(cache_snapshot.preview_page_file_ids))
+    page = min(max(1, page), total_pages)
+    page_idx = page - 1
+
+    if page_idx < len(cache_snapshot.preview_page_file_ids):
+        media = InputMediaPhoto(
+            media=cache_snapshot.preview_page_file_ids[page_idx],
+            caption=_build_top_caption(cache_snapshot, page, total_pages),
+        )
+    elif page_idx < len(cache_snapshot.preview_page_paths):
+        media = InputMediaPhoto(
+            media=FSInputFile(cache_snapshot.preview_page_paths[page_idx]),
+            caption=_build_top_caption(cache_snapshot, page, total_pages),
+        )
+    else:
+        await callback.answer("Страница недоступна", show_alert=False)
+        return
+
+    await callback.message.edit_media(media=media, reply_markup=_top_keyboard(page, total_pages))
+    await callback.answer()
 
 
 async def on_startup(bot: Bot) -> None:
