@@ -284,13 +284,13 @@ async def on_rate(callback: CallbackQuery) -> None:
     score = int(score_str)
     await callback.answer("Голос сохранен")
     avg = await service.add_vote(filename, score)
-    await asyncio.gather(
-        callback.message.edit_caption(
-            caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-            reply_markup=None,
-        ),
-        service.send_random_vote(callback.message),
+
+    next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
+    await callback.message.edit_caption(
+        caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+        reply_markup=None,
     )
+    await next_vote_task
 
 
 @router.message(Command("top"))
