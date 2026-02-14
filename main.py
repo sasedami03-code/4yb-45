@@ -42,11 +42,16 @@ class EmojiRatingBot:
         self.cache = TierCache()
         self.cache_lock = asyncio.Lock()
         self.refresh_task: asyncio.Task | None = None
+        self.emote_file_ids: dict[str, str] = {}
 
     async def init(self) -> None:
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self.db = await aiosqlite.connect(DATABASE_PATH)
+        await self.db.execute("PRAGMA journal_mode=WAL;")
+        await self.db.execute("PRAGMA synchronous=NORMAL;")
+        await self.db.execute("PRAGMA temp_store=MEMORY;")
+        await self.db.execute("PRAGMA cache_size=-20000;")
         await self.db.execute(
             """
             CREATE TABLE IF NOT EXISTS emotes (
@@ -91,28 +96,31 @@ class EmojiRatingBot:
             await message.answer("Папка assets пуста. Добавьте изображения эмодзи.")
             return
         filename = random.choice(self.assets)
-        await message.answer_photo(
-            photo=FSInputFile(ASSETS_DIR / filename),
+        photo_source: str | FSInputFile = self.emote_file_ids.get(filename, FSInputFile(ASSETS_DIR / filename))
+        sent_message = await message.answer_photo(
+            photo=photo_source,
             caption="Оцените эмодзи от 1 до 10:",
             reply_markup=self._vote_keyboard(filename),
         )
+        if sent_message.photo:
+            self.emote_file_ids[filename] = sent_message.photo[-1].file_id
 
     async def add_vote(self, filename: str, score: int) -> float:
         if not self.db:
             raise RuntimeError("DB is not initialized")
-        await self.db.execute(
+        async with self.db.execute(
             """
             UPDATE emotes
-            SET total_score = total_score + ?,
+            SET total_score = total_score + :score,
                 votes_count = votes_count + 1,
-                average_rating = CAST(total_score + ? AS REAL) / (votes_count + 1)
-            WHERE filename = ?
+                average_rating = CAST(total_score + :score AS REAL) / (votes_count + 1)
+            WHERE filename = :filename
+            RETURNING average_rating
             """,
-            (score, score, filename),
-        )
-        await self.db.commit()
-        async with self.db.execute("SELECT average_rating FROM emotes WHERE filename = ?", (filename,)) as cursor:
+            {"score": score, "filename": filename},
+        ) as cursor:
             row = await cursor.fetchone()
+        await self.db.commit()
         return float(row[0]) if row else 0.0
 
     async def fetch_sorted_emotes(self) -> list[dict]:
@@ -153,7 +161,7 @@ class EmojiRatingBot:
             else:
                 tiers["C"].append(emote)
 
-        tier_paths_map = draw_tier_set(tiers, ASSETS_DIR, CACHE_DIR)
+        tier_paths_map = await asyncio.to_thread(draw_tier_set, tiers, ASSETS_DIR, CACHE_DIR)
         ordered_paths = [tier_paths_map[key] for key in ("S", "A", "B", "C")]
         total_votes = await self.fetch_total_votes()
 
