@@ -364,13 +364,29 @@ class EmojiRatingBot:
             random.shuffle(shuffled)
             return shuffled[:limit]
 
-        matched = [name for name in self.assets if q in Path(name).stem.lower() or q in name.lower()]
-        if matched:
-            return matched[:limit]
+        scored: list[tuple[int, str]] = []
+        for name in self.assets:
+            display = self._display_name(name).lower()
+            stem = Path(name).stem.lower()
 
-        shuffled = self.assets[:]
-        random.shuffle(shuffled)
-        return shuffled[: min(limit, 5)]
+            score = 0
+            if q == display or q == stem:
+                score = 100
+            elif display.startswith(q) or stem.startswith(q):
+                score = 70
+            else:
+                display_tokens = display.replace("-", " ").replace("_", " ").split()
+                stem_tokens = stem.replace("-", " ").replace("_", " ").split()
+                if q in display_tokens or q in stem_tokens:
+                    score = 50
+                elif q in display or q in stem:
+                    score = 20
+
+            if score > 0:
+                scored.append((score, name))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [name for _, name in scored[:limit]]
 
     async def detect_by_photo(self, image_bytes: bytes, top_k: int = 3) -> list[tuple[str, float]]:
         if not self.asset_hashes:

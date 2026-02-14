@@ -61,3 +61,4 @@ def test_parse_ordered_labels():
         'Скелет',
     ])
     assert labels == ['Король', 'Скелет']
+
