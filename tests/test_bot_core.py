@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from bot.core import RateLimiter, parse_top_page
+from bot.core import RateLimiter, parse_media_urls, parse_top_page
 
 
 def test_parse_top_page_defaults_to_1():
@@ -27,3 +27,18 @@ def test_rate_limiter_blocks_after_limit_and_recovers():
 
     time.sleep(1.1)
     assert limiter.allow(user_id) is True
+
+
+def test_parse_media_urls_mixed_formats():
+    by_name, ordered = parse_media_urls(
+        [
+            "https://example.com/1.png",
+            "emoji_001.png,https://example.com/2.png",
+            "emoji_002.png|https://example.com/3.png",
+            "# comment",
+            "   ",
+        ]
+    )
+    assert ordered == ["https://example.com/1.png"]
+    assert by_name["emoji_001.png"] == "https://example.com/2.png"
+    assert by_name["emoji_002.png"] == "https://example.com/3.png"

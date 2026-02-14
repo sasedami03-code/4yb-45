@@ -23,6 +23,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultCachedPhoto,
+    InlineQueryResultPhoto,
     InlineQueryResultsButton,
     InputMediaPhoto,
     InputTextMessageContent,
@@ -35,10 +36,10 @@ if __package__ in {None, ""}:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from bot.core import RateLimiter, TierCache, parse_top_page
+    from bot.core import RateLimiter, TierCache, parse_media_urls, parse_top_page
     from bot.drawer import draw_tier_set, draw_top_preview
 else:
-    from .core import RateLimiter, TierCache, parse_top_page
+    from .core import RateLimiter, TierCache, parse_media_urls, parse_top_page
     from .drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -55,6 +56,7 @@ MAX_GLOBAL_CONCURRENT_SENDS = int(os.getenv("MAX_GLOBAL_CONCURRENT_SENDS", "20")
 MAX_TOP_REQUESTS_PER_WINDOW = int(os.getenv("MAX_TOP_REQUESTS_PER_WINDOW", "3"))
 TOP_WINDOW_SECONDS = int(os.getenv("TOP_WINDOW_SECONDS", "20"))
 INLINE_RESULTS_LIMIT = int(os.getenv("INLINE_RESULTS_LIMIT", "20"))
+EMOJI_URLS_FILE = os.getenv("EMOJI_URLS_FILE", "")
 
 
 class EmojiRatingBot:
@@ -68,6 +70,7 @@ class EmojiRatingBot:
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
         self.asset_hashes: dict[str, int] = {}
+        self.asset_urls: dict[str, str] = {}
         self.blocked_chat_ids: set[int] = set()
         self.on_demand_warmup_tasks: dict[int, asyncio.Task] = {}
         self.global_send_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_SENDS)
@@ -94,6 +97,7 @@ class EmojiRatingBot:
         )
         await self.db.commit()
         await self._sync_assets_to_db()
+        self._load_asset_urls()
         self._build_asset_hashes()
         if CACHE_CHAT_ID:
             await self._warmup_emote_file_ids()
@@ -124,6 +128,28 @@ class EmojiRatingBot:
         for filename in files:
             await self.db.execute("INSERT OR IGNORE INTO emotes(filename) VALUES (?)", (filename,))
         await self.db.commit()
+
+    def _load_asset_urls(self) -> None:
+        self.asset_urls = {}
+        if not EMOJI_URLS_FILE:
+            return
+
+        urls_path = Path(EMOJI_URLS_FILE)
+        if not urls_path.exists():
+            logging.warning("EMOJI_URLS_FILE не найден: %s", urls_path)
+            return
+
+        by_name, ordered = parse_media_urls(urls_path.read_text(encoding="utf-8").splitlines())
+        for filename in self.assets:
+            if filename in by_name:
+                self.asset_urls[filename] = by_name[filename]
+
+        missing = [name for name in self.assets if name not in self.asset_urls]
+        for idx, filename in enumerate(missing):
+            if idx < len(ordered):
+                self.asset_urls[filename] = ordered[idx]
+
+        logging.info("Загружено URL для inline: %s/%s", len(self.asset_urls), len(self.assets))
 
     @staticmethod
     def _ahash(image: Image.Image, size: int = 8) -> int:
@@ -507,6 +533,21 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
 
     for filename in found:
         display_name = service._display_name(filename)
+        media_url = service.asset_urls.get(filename)
+        if media_url:
+            results.append(
+                InlineQueryResultPhoto(
+                    id=f"inline-url:{filename}",
+                    photo_url=media_url,
+                    thumbnail_url=media_url,
+                    title=f"🎲 {display_name}",
+                    description="Отправить фото и собрать оценки 1..10",
+                    caption=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}",
+                    reply_markup=service._vote_keyboard(filename),
+                )
+            )
+            continue
+
         file_id = service.emote_file_ids.get(filename)
         if file_id:
             results.append(

@@ -50,3 +50,29 @@ def parse_top_page(text: str | None) -> int:
         return max(1, int(parts[1]))
     except ValueError:
         return 1
+
+
+def parse_media_urls(lines: list[str]) -> tuple[dict[str, str], list[str]]:
+    by_name: dict[str, str] = {}
+    ordered: list[str] = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        if ',' in line:
+            left, right = [x.strip() for x in line.split(',', 1)]
+            if left and right:
+                by_name[left] = right
+                continue
+
+        if '|' in line:
+            left, right = [x.strip() for x in line.split('|', 1)]
+            if left and right:
+                by_name[left] = right
+                continue
+
+        ordered.append(line)
+
+    return by_name, ordered
