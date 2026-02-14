@@ -5,6 +5,9 @@ from typing import Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
+_RESAMPLING = getattr(Image, "Resampling", Image)
+_LANCZOS = _RESAMPLING.LANCZOS
+
 CANVAS_WIDTH = 1000
 ICON_SIZE = 72
 GRID_PADDING_X = 20
@@ -57,7 +60,7 @@ def draw_tier_image(tier_name: str, emotes: Sequence[dict], assets_dir: Path, ou
         emote_path = assets_dir / emote["filename"]
         if emote_path.exists():
             with Image.open(emote_path) as source:
-                icon = source.convert("RGBA").resize((ICON_SIZE, ICON_SIZE), Image.Resampling.LANCZOS)
+                icon = source.convert("RGBA").resize((ICON_SIZE, ICON_SIZE), _LANCZOS)
             image.paste(icon, (x, y), icon)
         else:
             draw.rectangle((x, y, x + ICON_SIZE, y + ICON_SIZE), outline=(255, 70, 70), width=2)
@@ -112,7 +115,7 @@ def draw_top_preview(
         emote_path = assets_dir / emote["filename"]
         if emote_path.exists():
             with Image.open(emote_path) as source:
-                icon = source.convert("RGBA").resize((ICON_SIZE, ICON_SIZE), Image.Resampling.LANCZOS)
+                icon = source.convert("RGBA").resize((ICON_SIZE, ICON_SIZE), _LANCZOS)
             image.paste(icon, (x, y), icon)
 
         rating_text = f"{emote['average_rating']:.1f}"

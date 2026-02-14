@@ -8,6 +8,11 @@ from pathlib import Path
 
 from PIL import Image, ImageFilter, ImageOps
 
+_RESAMPLING = getattr(Image, "Resampling", Image)
+_BILINEAR = _RESAMPLING.BILINEAR
+_LANCZOS = _RESAMPLING.LANCZOS
+_ADAPTIVE_PALETTE = getattr(getattr(Image, "Palette", Image), "ADAPTIVE", getattr(Image, "ADAPTIVE", 1))
+
 
 @dataclass
 class TierCache:
@@ -100,7 +105,7 @@ def parse_ordered_labels(lines: list[str]) -> list[str]:
 
 
 def _ahash(image: Image.Image, size: int = 16) -> int:
-    gray = ImageOps.exif_transpose(image).convert("L").resize((size, size), Image.Resampling.BILINEAR)
+    gray = ImageOps.exif_transpose(image).convert("L").resize((size, size), _BILINEAR)
     pixels = list(gray.getdata())
     avg = sum(pixels) / len(pixels)
     bits = 0
@@ -111,7 +116,7 @@ def _ahash(image: Image.Image, size: int = 16) -> int:
 
 
 def _dhash(image: Image.Image, size: int = 16) -> int:
-    gray = ImageOps.exif_transpose(image).convert("L").resize((size + 1, size), Image.Resampling.BILINEAR)
+    gray = ImageOps.exif_transpose(image).convert("L").resize((size + 1, size), _BILINEAR)
     pixels = list(gray.getdata())
     bits = 0
     bit_idx = 0
@@ -130,7 +135,7 @@ def _hamming(a: int, b: int) -> int:
 
 
 def build_emoji_fingerprint(image: Image.Image) -> EmojiFingerprint:
-    prepared = ImageOps.exif_transpose(image).convert("RGBA").resize((128, 128), Image.Resampling.LANCZOS)
+    prepared = ImageOps.exif_transpose(image).convert("RGBA").resize((128, 128), _LANCZOS)
     alpha = prepared.getchannel("A")
     alpha_data = list(alpha.getdata())
     body_pixels = sum(1 for px in alpha_data if px > 12)
@@ -141,7 +146,7 @@ def build_emoji_fingerprint(image: Image.Image) -> EmojiFingerprint:
     edge_data = list(edge_img.getdata())
     edge_ratio = sum(1 for px in edge_data if px > 45) / len(edge_data)
 
-    quantized = rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=32)
+    quantized = rgb.convert("P", palette=_ADAPTIVE_PALETTE, colors=32)
     hist = quantized.histogram()[:32]
     total = float(sum(hist)) or 1.0
     color_hist = tuple(v / total for v in hist)

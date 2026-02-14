@@ -33,6 +33,9 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from PIL import Image, ImageChops, ImageStat
 
+_RESAMPLING = getattr(Image, "Resampling", Image)
+_LANCZOS = _RESAMPLING.LANCZOS
+
 if __package__ in {None, ""}:
     import sys
 
@@ -252,7 +255,7 @@ class EmojiRatingBot:
                 with Image.open(path) as img:
                     normalized = img.convert("RGB")
                     self.asset_fingerprints[filename] = build_emoji_fingerprint(normalized)
-                    self.asset_thumbnails[filename] = normalized.resize((64, 64), Image.Resampling.LANCZOS)
+                    self.asset_thumbnails[filename] = normalized.resize((64, 64), _LANCZOS)
             except OSError:
                 continue
 
@@ -431,7 +434,7 @@ class EmojiRatingBot:
 
     @staticmethod
     def _thumbnail_similarity(query_image: Image.Image, asset_thumb: Image.Image) -> float:
-        query_thumb = query_image.convert("RGB").resize((64, 64), Image.Resampling.LANCZOS)
+        query_thumb = query_image.convert("RGB").resize((64, 64), _LANCZOS)
         diff = ImageChops.difference(query_thumb, asset_thumb)
         mean_abs = sum(ImageStat.Stat(diff).mean) / 3.0
         return max(0.0, 1.0 - (mean_abs / 255.0))
