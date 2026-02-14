@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from PIL import Image, ImageFilter, ImageOps
+
 
 @dataclass
 class TierCache:
@@ -20,6 +22,15 @@ class TierCache:
     preview_page_file_ids: list[str] = field(default_factory=list)
     preview_page_paths: list[Path] = field(default_factory=list)
     total_emotes: int = 0
+
+
+@dataclass(frozen=True)
+class EmojiFingerprint:
+    ahash: int
+    dhash: int
+    color_hist: tuple[float, ...]
+    body_ratio: float
+    edge_ratio: float
 
 
 class RateLimiter:
@@ -86,3 +97,73 @@ def parse_ordered_labels(lines: list[str]) -> list[str]:
             continue
         labels.append(line)
     return labels
+
+
+def _ahash(image: Image.Image, size: int = 16) -> int:
+    gray = ImageOps.exif_transpose(image).convert("L").resize((size, size), Image.Resampling.BILINEAR)
+    pixels = list(gray.getdata())
+    avg = sum(pixels) / len(pixels)
+    bits = 0
+    for idx, px in enumerate(pixels):
+        if px >= avg:
+            bits |= 1 << idx
+    return bits
+
+
+def _dhash(image: Image.Image, size: int = 16) -> int:
+    gray = ImageOps.exif_transpose(image).convert("L").resize((size + 1, size), Image.Resampling.BILINEAR)
+    pixels = list(gray.getdata())
+    bits = 0
+    bit_idx = 0
+    row_stride = size + 1
+    for y in range(size):
+        row = y * row_stride
+        for x in range(size):
+            if pixels[row + x] <= pixels[row + x + 1]:
+                bits |= 1 << bit_idx
+            bit_idx += 1
+    return bits
+
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def build_emoji_fingerprint(image: Image.Image) -> EmojiFingerprint:
+    prepared = ImageOps.exif_transpose(image).convert("RGBA").resize((128, 128), Image.Resampling.LANCZOS)
+    alpha = prepared.getchannel("A")
+    alpha_data = list(alpha.getdata())
+    body_pixels = sum(1 for px in alpha_data if px > 12)
+    body_ratio = body_pixels / len(alpha_data)
+
+    rgb = prepared.convert("RGB")
+    edge_img = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+    edge_data = list(edge_img.getdata())
+    edge_ratio = sum(1 for px in edge_data if px > 45) / len(edge_data)
+
+    quantized = rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=32)
+    hist = quantized.histogram()[:32]
+    total = float(sum(hist)) or 1.0
+    color_hist = tuple(v / total for v in hist)
+
+    return EmojiFingerprint(
+        ahash=_ahash(rgb),
+        dhash=_dhash(rgb),
+        color_hist=color_hist,
+        body_ratio=body_ratio,
+        edge_ratio=edge_ratio,
+    )
+
+
+def emoji_similarity_score(query: EmojiFingerprint, candidate: EmojiFingerprint) -> float:
+    hash_a = 1.0 - (_hamming(query.ahash, candidate.ahash) / 256.0)
+    hash_d = 1.0 - (_hamming(query.dhash, candidate.dhash) / 256.0)
+
+    color_diff = sum(abs(a - b) for a, b in zip(query.color_hist, candidate.color_hist)) / 2.0
+    color_score = max(0.0, 1.0 - color_diff)
+
+    body_score = max(0.0, 1.0 - abs(query.body_ratio - candidate.body_ratio) / 0.45)
+    edge_score = max(0.0, 1.0 - abs(query.edge_ratio - candidate.edge_ratio) / 0.45)
+
+    forensic_score = (hash_a * 0.35) + (hash_d * 0.25) + (color_score * 0.2) + (body_score * 0.12) + (edge_score * 0.08)
+    return max(0.0, min(1.0, forensic_score))

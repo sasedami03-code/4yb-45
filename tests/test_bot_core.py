@@ -1,10 +1,22 @@
 import sys
 import time
+
+import pytest
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from bot.core import RateLimiter, parse_media_urls, parse_ordered_labels, parse_top_page
+PIL = pytest.importorskip("PIL")
+from PIL import Image, ImageDraw
+
+from bot.core import (
+    RateLimiter,
+    build_emoji_fingerprint,
+    emoji_similarity_score,
+    parse_media_urls,
+    parse_ordered_labels,
+    parse_top_page,
+)
 
 
 def test_parse_top_page_defaults_to_1():
@@ -62,3 +74,41 @@ def test_parse_ordered_labels():
     ])
     assert labels == ['Король', 'Скелет']
 
+
+
+def _make_square(color: tuple[int, int, int], accent: tuple[int, int, int] | None = None) -> Image.Image:
+    img = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((16, 16, 112, 112), radius=22, fill=color)
+    if accent:
+        draw.ellipse((46, 46, 82, 82), fill=accent)
+    return img
+
+
+def test_emoji_similarity_prefers_visual_match():
+    red = _make_square((230, 60, 60), accent=(255, 220, 80))
+    red_variant = _make_square((220, 70, 70), accent=(250, 210, 70))
+    blue = _make_square((60, 90, 220), accent=(200, 240, 255))
+
+    red_fp = build_emoji_fingerprint(red)
+    red_variant_fp = build_emoji_fingerprint(red_variant)
+    blue_fp = build_emoji_fingerprint(blue)
+
+    close_score = emoji_similarity_score(red_fp, red_variant_fp)
+    far_score = emoji_similarity_score(red_fp, blue_fp)
+
+    assert close_score > far_score
+    assert close_score > 0.70
+
+
+def test_emoji_similarity_with_transparency_body_shape():
+    full = Image.new("RGBA", (128, 128), (255, 200, 0, 255))
+    sparse = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(sparse)
+    draw.ellipse((46, 46, 82, 82), fill=(255, 200, 0, 255))
+
+    full_fp = build_emoji_fingerprint(full)
+    sparse_fp = build_emoji_fingerprint(sparse)
+
+    score = emoji_similarity_score(full_fp, sparse_fp)
+    assert score < 0.75

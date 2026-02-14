@@ -37,10 +37,28 @@ if __package__ in {None, ""}:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from bot.core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
+    from bot.core import (
+        RateLimiter,
+        TierCache,
+        EmojiFingerprint,
+        build_emoji_fingerprint,
+        emoji_similarity_score,
+        parse_media_urls,
+        parse_ordered_labels,
+        parse_top_page,
+    )
     from bot.drawer import draw_tier_set, draw_top_preview
 else:
-    from .core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
+    from .core import (
+        RateLimiter,
+        TierCache,
+        EmojiFingerprint,
+        build_emoji_fingerprint,
+        emoji_similarity_score,
+        parse_media_urls,
+        parse_ordered_labels,
+        parse_top_page,
+    )
     from .drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -72,7 +90,7 @@ class EmojiRatingBot:
         self.refresh_task: asyncio.Task | None = None
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
-        self.asset_hashes: dict[str, int] = {}
+        self.asset_fingerprints: dict[str, EmojiFingerprint] = {}
         self.asset_urls: dict[str, str] = {}
         self.asset_labels: dict[str, str] = {}
         self.blocked_chat_ids: set[int] = set()
@@ -112,7 +130,7 @@ class EmojiRatingBot:
         await self._sync_assets_to_db()
         self._load_asset_urls()
         self._load_asset_labels()
-        self._build_asset_hashes()
+        self._build_asset_fingerprints()
         if CACHE_CHAT_ID:
             await self._warmup_emote_file_ids()
 
@@ -224,28 +242,13 @@ class EmojiRatingBot:
 
         logging.info("Загружено названий эмодзи: %s/%s", len(self.asset_labels), len(self.assets))
 
-    @staticmethod
-    def _ahash(image: Image.Image, size: int = 8) -> int:
-        gray = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
-        pixels = list(gray.tobytes())
-        avg = sum(pixels) / len(pixels)
-        bits = 0
-        for idx, px in enumerate(pixels):
-            if px >= avg:
-                bits |= 1 << idx
-        return bits
-
-    @staticmethod
-    def _hamming(a: int, b: int) -> int:
-        return (a ^ b).bit_count()
-
-    def _build_asset_hashes(self) -> None:
-        self.asset_hashes.clear()
+    def _build_asset_fingerprints(self) -> None:
+        self.asset_fingerprints.clear()
         for filename in self.assets:
             path = ASSETS_DIR / filename
             try:
                 with Image.open(path) as img:
-                    self.asset_hashes[filename] = self._ahash(img)
+                    self.asset_fingerprints[filename] = build_emoji_fingerprint(img)
             except OSError:
                 continue
 
@@ -398,19 +401,18 @@ class EmojiRatingBot:
         return [name for _, name in scored[:limit]]
 
     async def detect_by_photo(self, image_bytes: bytes, top_k: int = 3) -> list[tuple[str, float]]:
-        if not self.asset_hashes:
+        if not self.asset_fingerprints:
             return []
 
         try:
             with Image.open(BytesIO(image_bytes)) as img:
-                query_hash = self._ahash(img)
+                query_fp = build_emoji_fingerprint(img)
         except OSError:
             return []
 
         scored: list[tuple[str, float]] = []
-        for filename, h in self.asset_hashes.items():
-            dist = self._hamming(query_hash, h)
-            similarity = max(0.0, 1.0 - (dist / 64.0))
+        for filename, candidate_fp in self.asset_fingerprints.items():
+            similarity = emoji_similarity_score(query_fp, candidate_fp)
             scored.append((filename, similarity))
 
         scored.sort(key=lambda x: x[1], reverse=True)
