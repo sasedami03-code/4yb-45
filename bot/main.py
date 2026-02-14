@@ -156,14 +156,41 @@ class EmojiRatingBot:
             except TelegramBadRequest as exc:
                 if "chat not found" in str(exc).lower():
                     logging.error(
-                        "CACHE_CHAT_ID=%s недоступен (chat not found). Inline продолжит работать в текстовом fallback-режиме. "
-                        "Укажите корректный chat_id и добавьте туда бота.",
+                        "CACHE_CHAT_ID=%s недоступен (chat not found). Включаю on-demand прогрев через личку пользователя inline.",
                         CACHE_CHAT_ID,
                     )
                     return
                 logging.exception("Не удалось прогреть file_id для %s", filename)
             except Exception:  # noqa: BLE001
                 logging.exception("Не удалось прогреть file_id для %s", filename)
+
+    async def ensure_file_id(self, filename: str, user_chat_id: int | None = None) -> str | None:
+        existing = self.emote_file_ids.get(filename)
+        if existing:
+            return existing
+
+        candidate_chats: list[int] = []
+        if CACHE_CHAT_ID:
+            candidate_chats.append(CACHE_CHAT_ID)
+        if user_chat_id and user_chat_id not in candidate_chats:
+            candidate_chats.append(user_chat_id)
+
+        for chat_id in candidate_chats:
+            try:
+                async with self.global_send_semaphore:
+                    sent = await self.bot.send_photo(chat_id=chat_id, photo=FSInputFile(ASSETS_DIR / filename))
+                if sent.photo:
+                    file_id = sent.photo[-1].file_id
+                    self.emote_file_ids[filename] = file_id
+                    return file_id
+            except TelegramBadRequest as exc:
+                msg = str(exc).lower()
+                if "chat not found" in msg or "bot can't initiate conversation" in msg or "forbidden" in msg:
+                    continue
+                logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
+            except Exception:  # noqa: BLE001
+                logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
+        return None
 
     def _vote_keyboard(self, filename: str) -> InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
@@ -416,7 +443,7 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
 
     for filename in found:
         display_name = service._display_name(filename)
-        file_id = service.emote_file_ids.get(filename)
+        file_id = await service.ensure_file_id(filename, inline_query.from_user.id if inline_query.from_user else None)
         if file_id:
             results.append(
                 InlineQueryResultCachedPhoto(
@@ -433,7 +460,7 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
                 InlineQueryResultArticle(
                     id=f"inline-text:{filename}",
                     title=f"🎲 {display_name}",
-                    description="Пока без превью фото (проверьте CACHE_CHAT_ID и доступ бота в чат)",
+                    description="Не удалось отправить фото. Напишите боту в личку /start и попробуйте снова.",
                     input_message_content=InputTextMessageContent(
                         message_text=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}"
                     ),
