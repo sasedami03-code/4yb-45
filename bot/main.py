@@ -400,23 +400,113 @@ class EmojiRatingBot:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [name for _, name in scored[:limit]]
 
+    @staticmethod
+    def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        iw = max(0, inter_x2 - inter_x1)
+        ih = max(0, inter_y2 - inter_y1)
+        inter = iw * ih
+        if inter == 0:
+            return 0.0
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return inter / (area_a + area_b - inter)
+
+    def _best_asset_for_fingerprint(self, query_fp: EmojiFingerprint, shortlist: int = 48) -> tuple[str | None, float]:
+        if not self.asset_fingerprints:
+            return None, 0.0
+
+        # Быстрый префильтр по близости цветового профиля
+        color_ranked: list[tuple[float, str]] = []
+        for filename, asset_fp in self.asset_fingerprints.items():
+            diff = sum(abs(a - b) for a, b in zip(query_fp.color_hist, asset_fp.color_hist)) / 2.0
+            color_ranked.append((diff, filename))
+        color_ranked.sort(key=lambda x: x[0])
+
+        best_name: str | None = None
+        best_score = 0.0
+        for _, filename in color_ranked[:shortlist]:
+            score = emoji_similarity_score(query_fp, self.asset_fingerprints[filename])
+            if score > best_score:
+                best_score = score
+                best_name = filename
+
+        return best_name, best_score
+
+    def _detect_multi_candidates(self, image: Image.Image, max_regions: int = 3) -> list[tuple[str, float]]:
+        width, height = image.size
+        if width < 64 or height < 64:
+            return []
+
+        rgb = image.convert("RGB")
+        min_side = min(width, height)
+        scales = (0.12, 0.16, 0.2, 0.24, 0.28, 0.34)
+
+        candidates: list[tuple[float, str, tuple[int, int, int, int]]] = []
+        for scale in scales:
+            win = int(min_side * scale)
+            if win < 48:
+                continue
+            step = max(18, win // 3)
+            y = 0
+            while y + win <= height:
+                x = 0
+                while x + win <= width:
+                    box = (x, y, x + win, y + win)
+                    crop = rgb.crop(box)
+                    fp = build_emoji_fingerprint(crop)
+                    filename, score = self._best_asset_for_fingerprint(fp)
+                    if filename and score >= 0.72:
+                        candidates.append((score, filename, box))
+                    x += step
+                y += step
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        picked: list[tuple[float, str, tuple[int, int, int, int]]] = []
+        used_names: set[str] = set()
+
+        for score, filename, box in candidates:
+            if filename in used_names:
+                continue
+            if any(self._box_iou(box, prev_box) > 0.32 for _, _, prev_box in picked):
+                continue
+            picked.append((score, filename, box))
+            used_names.add(filename)
+            if len(picked) >= max_regions:
+                break
+
+        return [(filename, score) for score, filename, _ in picked]
+
     async def detect_by_photo(self, image_bytes: bytes, top_k: int = 3) -> list[tuple[str, float]]:
         if not self.asset_fingerprints:
             return []
 
         try:
             with Image.open(BytesIO(image_bytes)) as img:
-                query_fp = build_emoji_fingerprint(img)
+                rgb = img.convert("RGB")
+                whole_fp = build_emoji_fingerprint(rgb)
+                whole_name, whole_score = self._best_asset_for_fingerprint(whole_fp)
+                multi = self._detect_multi_candidates(rgb, max_regions=top_k)
         except OSError:
             return []
 
-        scored: list[tuple[str, float]] = []
-        for filename, candidate_fp in self.asset_fingerprints.items():
-            similarity = emoji_similarity_score(query_fp, candidate_fp)
-            scored.append((filename, similarity))
+        results: list[tuple[str, float]] = []
+        if multi:
+            results.extend(multi)
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:top_k]
+        if whole_name and all(name != whole_name for name, _ in results):
+            results.append((whole_name, whole_score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
         if not self.assets:
