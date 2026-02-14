@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import random
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from drawer import draw_tier_set
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "assets"))
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "database.db"))
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
+CACHE_UPDATE_MINUTES = int(os.getenv("CACHE_UPDATE_MINUTES", "30"))
+CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID", "0"))
+
+
+@dataclass
+class TierCache:
+    file_ids: list[str] = field(default_factory=list)
+    local_paths: list[Path] = field(default_factory=list)
+    generated_at: datetime | None = None
+    next_update_at: datetime | None = None
+    total_votes: int = 0
+
+
+class EmojiRatingBot:
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.db: aiosqlite.Connection | None = None
+        self.assets: list[str] = []
+        self.cache = TierCache()
+        self.cache_lock = asyncio.Lock()
+        self.refresh_task: asyncio.Task | None = None
+
+    async def init(self) -> None:
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.db = await aiosqlite.connect(DATABASE_PATH)
+        await self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS emotes (
+                filename TEXT PRIMARY KEY,
+                total_score INTEGER NOT NULL DEFAULT 0,
+                votes_count INTEGER NOT NULL DEFAULT 0,
+                average_rating REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await self.db.commit()
+        await self._sync_assets_to_db()
+
+    async def close(self) -> None:
+        if self.refresh_task:
+            self.refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.refresh_task
+        if self.db:
+            await self.db.close()
+
+    async def _sync_assets_to_db(self) -> None:
+        files = sorted(
+            file.name for file in ASSETS_DIR.iterdir() if file.is_file() and file.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+        self.assets = files
+        if not self.db:
+            return
+        for filename in files:
+            await self.db.execute("INSERT OR IGNORE INTO emotes(filename) VALUES (?)", (filename,))
+        await self.db.commit()
+
+    def _vote_keyboard(self, filename: str) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        for score in range(1, 11):
+            kb.add(InlineKeyboardButton(text=str(score), callback_data=f"rate:{score}:{filename}"))
+        kb.adjust(5)
+        return kb.as_markup()
+
+    async def send_random_vote(self, message: Message) -> None:
+        if not self.assets:
+            await message.answer("Папка assets пуста. Добавьте изображения эмодзи.")
+            return
+        filename = random.choice(self.assets)
+        await message.answer_photo(
+            photo=FSInputFile(ASSETS_DIR / filename),
+            caption="Оцените эмодзи от 1 до 10:",
+            reply_markup=self._vote_keyboard(filename),
+        )
+
+    async def add_vote(self, filename: str, score: int) -> float:
+        if not self.db:
+            raise RuntimeError("DB is not initialized")
+        await self.db.execute(
+            """
+            UPDATE emotes
+            SET total_score = total_score + ?,
+                votes_count = votes_count + 1,
+                average_rating = CAST(total_score + ? AS REAL) / (votes_count + 1)
+            WHERE filename = ?
+            """,
+            (score, score, filename),
+        )
+        await self.db.commit()
+        async with self.db.execute("SELECT average_rating FROM emotes WHERE filename = ?", (filename,)) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0]) if row else 0.0
+
+    async def fetch_sorted_emotes(self) -> list[dict]:
+        if not self.db:
+            return []
+        async with self.db.execute(
+            "SELECT filename, total_score, votes_count, average_rating FROM emotes ORDER BY average_rating DESC, votes_count DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "filename": row[0],
+                "total_score": row[1],
+                "votes_count": row[2],
+                "average_rating": float(row[3] or 0),
+            }
+            for row in rows
+        ]
+
+    async def fetch_total_votes(self) -> int:
+        if not self.db:
+            return 0
+        async with self.db.execute("SELECT COALESCE(SUM(votes_count), 0) FROM emotes") as cursor:
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
+
+    async def regenerate_cache(self) -> None:
+        emotes = await self.fetch_sorted_emotes()
+        tiers = {"S": [], "A": [], "B": [], "C": []}
+        for emote in emotes:
+            rating = emote["average_rating"]
+            if rating >= 9.0:
+                tiers["S"].append(emote)
+            elif rating >= 7.0:
+                tiers["A"].append(emote)
+            elif rating >= 5.0:
+                tiers["B"].append(emote)
+            else:
+                tiers["C"].append(emote)
+
+        tier_paths_map = draw_tier_set(tiers, ASSETS_DIR, CACHE_DIR)
+        ordered_paths = [tier_paths_map[key] for key in ("S", "A", "B", "C")]
+        total_votes = await self.fetch_total_votes()
+
+        new_file_ids: list[str] = []
+        if CACHE_CHAT_ID:
+            media = [InputMediaPhoto(media=FSInputFile(path)) for path in ordered_paths]
+            sent_messages = await self.bot.send_media_group(chat_id=CACHE_CHAT_ID, media=media)
+            new_file_ids = [msg.photo[-1].file_id for msg in sent_messages if msg.photo]
+
+        async with self.cache_lock:
+            self.cache.local_paths = ordered_paths
+            self.cache.file_ids = new_file_ids
+            self.cache.total_votes = total_votes
+            self.cache.generated_at = datetime.now()
+            self.cache.next_update_at = self.cache.generated_at + timedelta(minutes=CACHE_UPDATE_MINUTES)
+
+    async def refresh_loop(self) -> None:
+        while True:
+            try:
+                await self.regenerate_cache()
+            except Exception:  # noqa: BLE001
+                logging.exception("Ошибка обновления tier-кэша")
+            await asyncio.sleep(CACHE_UPDATE_MINUTES * 60)
+
+
+router = Router()
+service: EmojiRatingBot | None = None
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "Привет! Я бот рейтинга эмодзи Clash Royale.\n"
+        "Команды:\n"
+        "/vote — оценить случайный эмодзи\n"
+        "/top — посмотреть текущий рейтинг"
+    )
+
+
+@router.message(Command("vote"))
+@router.message(F.text == "🎲 Оценить")
+async def cmd_vote(message: Message) -> None:
+    if service:
+        await service.send_random_vote(message)
+
+
+@router.callback_query(F.data.startswith("rate:"))
+async def on_rate(callback: CallbackQuery) -> None:
+    if not service or not callback.message:
+        return
+
+    _, score_str, filename = callback.data.split(":", 2)
+    score = int(score_str)
+    avg = await service.add_vote(filename, score)
+    await callback.message.edit_caption(
+        caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+        reply_markup=None,
+    )
+    await callback.answer("Голос сохранен")
+    await service.send_random_vote(callback.message)
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message) -> None:
+    if not service:
+        return
+
+    async with service.cache_lock:
+        cache_snapshot = TierCache(
+            file_ids=list(service.cache.file_ids),
+            local_paths=list(service.cache.local_paths),
+            generated_at=service.cache.generated_at,
+            next_update_at=service.cache.next_update_at,
+            total_votes=service.cache.total_votes,
+        )
+
+    if not cache_snapshot.file_ids and not cache_snapshot.local_paths:
+        await message.answer("Рейтинг еще не готов, попробуйте через минуту.")
+        return
+
+    generated = cache_snapshot.generated_at.strftime("%H:%M") if cache_snapshot.generated_at else "-"
+    next_update = cache_snapshot.next_update_at.strftime("%H:%M") if cache_snapshot.next_update_at else "-"
+
+    caption = (
+        "🏆 Текущий рейтинг эмодзи\n"
+        f"🔄 Данные обновляются раз в {CACHE_UPDATE_MINUTES} минут.\n"
+        f"🕒 Последнее обновление: {generated}\n"
+        f"⏳ Следующее обновление: {next_update}\n\n"
+        f"Всего голосов в базе: {cache_snapshot.total_votes}"
+    )
+
+    media: list[InputMediaPhoto] = []
+    if cache_snapshot.file_ids:
+        media = [InputMediaPhoto(media=file_id) for file_id in cache_snapshot.file_ids]
+    else:
+        media = [InputMediaPhoto(media=FSInputFile(path)) for path in cache_snapshot.local_paths]
+
+    if media:
+        media[0].caption = caption
+        await message.answer_media_group(media=media)
+
+
+async def on_startup(bot: Bot) -> None:
+    global service
+    service = EmojiRatingBot(bot)
+    await service.init()
+    service.refresh_task = asyncio.create_task(service.refresh_loop())
+
+
+async def on_shutdown(bot: Bot) -> None:
+    if service:
+        await service.close()
+
+
+async def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("Укажите BOT_TOKEN в переменных окружения")
+
+    logging.basicConfig(level=logging.INFO)
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
