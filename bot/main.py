@@ -223,6 +223,33 @@ class EmojiRatingBot:
 
         self.on_demand_warmup_tasks[user_chat_id] = asyncio.create_task(_runner())
 
+    def schedule_private_warmup(self, user_chat_id: int, limit: int = 20) -> None:
+        task = self.on_demand_warmup_tasks.get(user_chat_id)
+        if task and not task.done():
+            return
+
+        async def _runner() -> None:
+            to_warm = [name for name in self.assets if name not in self.emote_file_ids][:limit]
+            for name in to_warm:
+                try:
+                    async with self.global_send_semaphore:
+                        sent = await self.bot.send_photo(chat_id=user_chat_id, photo=FSInputFile(ASSETS_DIR / name))
+                    if sent.photo:
+                        self.emote_file_ids[name] = sent.photo[-1].file_id
+                    with contextlib.suppress(Exception):
+                        await self.bot.delete_message(chat_id=user_chat_id, message_id=sent.message_id)
+                except TelegramForbiddenError:
+                    return
+                except TelegramBadRequest as exc:
+                    msg = str(exc).lower()
+                    if "bot can't initiate conversation" in msg or "forbidden" in msg:
+                        return
+                    logging.exception("Не удалось прогреть %s в личке %s", name, user_chat_id)
+                except Exception:  # noqa: BLE001
+                    logging.exception("Не удалось прогреть %s в личке %s", name, user_chat_id)
+
+        self.on_demand_warmup_tasks[user_chat_id] = asyncio.create_task(_runner())
+
     def _vote_keyboard(self, filename: str) -> InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
         for score in range(1, 11):
@@ -442,12 +469,16 @@ def _top_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+    if service and message.chat.type == "private":
+        service.schedule_private_warmup(message.chat.id, limit=20)
+
     await message.answer(
         "Привет! Я бот рейтинга эмодзи Clash Royale.\n"
         "Команды:\n"
         "/vote — оценить случайный эмодзи\n"
         "/top [страница] — быстрый топ-превью рейтинг\n"
-        "Инлайн: @your_bot или @your_bot miner"
+        "Инлайн: @your_bot или @your_bot miner\n"
+        "Если только что нажали /start — подождите 2-3 секунды, я прогреваю фото для inline."
     )
 
 
