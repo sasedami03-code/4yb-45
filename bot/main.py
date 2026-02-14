@@ -436,13 +436,23 @@ class EmojiRatingBot:
             color_ranked.append((diff, filename))
         color_ranked.sort(key=lambda x: x[0])
 
-        best_name: str | None = None
-        best_score = 0.0
+        ranked: list[tuple[float, str]] = []
         for _, filename in color_ranked[:shortlist]:
             score = emoji_similarity_score(query_fp, self.asset_fingerprints[filename])
-            if score > best_score:
-                best_score = score
-                best_name = filename
+            ranked.append((score, filename))
+
+        if not ranked:
+            return None, 0.0
+
+        ranked.sort(reverse=True)
+        best_score, best_name = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+
+        # Защита от ложных совпадений: нужен хороший абсолютный скор и отрыв от 2-го места
+        if best_score < 0.88:
+            return None, 0.0
+        if (best_score - second_score) < 0.03:
+            return None, 0.0
 
         return best_name, best_score
 
@@ -472,7 +482,7 @@ class EmojiRatingBot:
                         continue
                     fp = build_emoji_fingerprint(crop)
                     filename, score = self._best_asset_for_fingerprint(fp)
-                    if filename and score >= 0.81:
+                    if filename and score >= 0.88:
                         candidates.append((score, filename, box))
                     x += step
                 y += step
@@ -513,14 +523,14 @@ class EmojiRatingBot:
         if multi:
             results.extend(multi)
 
-        if whole_name and whole_score >= 0.84 and all(name != whole_name for name, _ in results):
+        if whole_name and whole_score >= 0.9 and all(name != whole_name for name, _ in results):
             results.append((whole_name, whole_score))
 
         results.sort(key=lambda x: x[1], reverse=True)
-        filtered = [(name, score) for name, score in results if score >= 0.84]
+        filtered = [(name, score) for name, score in results if score >= 0.9]
         if len(filtered) >= 2:
             best = filtered[0][1]
-            filtered = [item for item in filtered if (best - item[1]) <= 0.18]
+            filtered = [item for item in filtered if (best - item[1]) <= 0.12]
         return filtered[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
