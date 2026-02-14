@@ -561,6 +561,7 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
                 )
             )
         else:
+            missing_for_user.append(filename)
             results.append(
                 InlineQueryResultArticle(
                     id=f"inline-text:{filename}",
@@ -604,7 +605,7 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
 
 @router.callback_query(F.data.startswith("rate:"))
 async def on_rate(callback: CallbackQuery) -> None:
-    if not service or not callback.message or not callback.data:
+    if not service or not callback.data:
         return
 
     user_id = callback.from_user.id if callback.from_user else 0
@@ -623,23 +624,40 @@ async def on_rate(callback: CallbackQuery) -> None:
             raise
 
     avg = await service.add_vote(filename, score)
+    result_text = f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}"
 
-    next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
     try:
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-                reply_markup=None,
-            )
-        else:
-            await callback.message.edit_text(
-                text=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-                reply_markup=None,
-            )
+        if callback.inline_message_id:
+            # Голосование в inline-посте (в чате через @bot)
+            try:
+                await callback.bot.edit_message_caption(
+                    inline_message_id=callback.inline_message_id,
+                    caption=result_text,
+                    reply_markup=None,
+                )
+            except TelegramBadRequest:
+                await callback.bot.edit_message_text(
+                    inline_message_id=callback.inline_message_id,
+                    text=result_text,
+                    reply_markup=None,
+                )
+        elif callback.message:
+            # Голосование в обычном /vote потоке
+            next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
+            if callback.message.photo:
+                await callback.message.edit_caption(
+                    caption=result_text,
+                    reply_markup=None,
+                )
+            else:
+                await callback.message.edit_text(
+                    text=result_text,
+                    reply_markup=None,
+                )
+            await next_vote_task
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             logging.warning("Не удалось обновить сообщение после голоса: %s", exc)
-    await next_vote_task
 
 
 @router.message(Command("top"))
