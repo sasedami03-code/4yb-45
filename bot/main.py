@@ -23,6 +23,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultCachedPhoto,
+    InlineQueryResultsButton,
     InputMediaPhoto,
     InputTextMessageContent,
     Message,
@@ -184,7 +185,8 @@ class EmojiRatingBot:
             candidate_chats.append(user_chat_id)
 
         for chat_id in candidate_chats:
-            if chat_id in self.blocked_chat_ids:
+            is_cache_chat = bool(CACHE_CHAT_ID and chat_id == CACHE_CHAT_ID)
+            if is_cache_chat and chat_id in self.blocked_chat_ids:
                 continue
             try:
                 async with self.global_send_semaphore:
@@ -195,12 +197,14 @@ class EmojiRatingBot:
                     return file_id
             except TelegramBadRequest as exc:
                 msg = str(exc).lower()
-                if "chat not found" in msg or "forbidden" in msg:
-                    self.blocked_chat_ids.add(chat_id)
+                if "chat not found" in msg or "forbidden" in msg or "bot can't initiate conversation" in msg:
+                    if is_cache_chat:
+                        self.blocked_chat_ids.add(chat_id)
                     continue
                 logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
             except TelegramForbiddenError:
-                self.blocked_chat_ids.add(chat_id)
+                if is_cache_chat:
+                    self.blocked_chat_ids.add(chat_id)
                 continue
             except Exception:  # noqa: BLE001
                 logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
@@ -512,8 +516,12 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
     if missing_for_user and inline_query.from_user:
         service.schedule_on_demand_warmup(inline_query.from_user.id, missing_for_user[:5])
 
+    answer_button = None
+    if missing_for_user:
+        answer_button = InlineQueryResultsButton(text="Открыть бота и нажать /start", start_parameter="inline_warmup")
+
     try:
-        await inline_query.answer(results, cache_time=1, is_personal=True)
+        await inline_query.answer(results, cache_time=1, is_personal=True, button=answer_button)
     except TelegramBadRequest as exc:
         if "query is too old" in str(exc).lower() or "query id is invalid" in str(exc).lower():
             logging.warning("Inline query просрочен: %s", exc)
