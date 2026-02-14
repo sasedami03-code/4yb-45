@@ -5,6 +5,8 @@ import contextlib
 import logging
 import os
 import random
+import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,7 +17,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from drawer import draw_tier_set
+from drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "assets"))
@@ -23,6 +25,12 @@ DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "database.db"))
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_UPDATE_MINUTES = int(os.getenv("CACHE_UPDATE_MINUTES", "30"))
 CACHE_CHAT_ID = int(os.getenv("CACHE_CHAT_ID", "0"))
+
+MAX_UPDATES_PER_USER_WINDOW = int(os.getenv("MAX_UPDATES_PER_USER_WINDOW", "12"))
+RATE_WINDOW_SECONDS = int(os.getenv("RATE_WINDOW_SECONDS", "10"))
+MAX_GLOBAL_CONCURRENT_SENDS = int(os.getenv("MAX_GLOBAL_CONCURRENT_SENDS", "20"))
+MAX_TOP_REQUESTS_PER_WINDOW = int(os.getenv("MAX_TOP_REQUESTS_PER_WINDOW", "3"))
+TOP_WINDOW_SECONDS = int(os.getenv("TOP_WINDOW_SECONDS", "20"))
 
 
 @dataclass
@@ -33,6 +41,26 @@ class TierCache:
     next_update_at: datetime | None = None
     total_votes: int = 0
     skipped_regenerations: int = 0
+    preview_file_id: str | None = None
+    preview_path: Path | None = None
+
+
+class RateLimiter:
+    def __init__(self, limit: int, window_seconds: int):
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.events: dict[int, deque[float]] = defaultdict(deque)
+
+    def allow(self, key: int) -> bool:
+        now = time.monotonic()
+        bucket = self.events[key]
+        threshold = now - self.window_seconds
+        while bucket and bucket[0] < threshold:
+            bucket.popleft()
+        if len(bucket) >= self.limit:
+            return False
+        bucket.append(now)
+        return True
 
 
 class EmojiRatingBot:
@@ -45,6 +73,9 @@ class EmojiRatingBot:
         self.refresh_task: asyncio.Task | None = None
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
+        self.global_send_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_SENDS)
+        self.vote_rate_limiter = RateLimiter(MAX_UPDATES_PER_USER_WINDOW, RATE_WINDOW_SECONDS)
+        self.top_rate_limiter = RateLimiter(MAX_TOP_REQUESTS_PER_WINDOW, TOP_WINDOW_SECONDS)
 
     async def init(self) -> None:
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,13 +128,16 @@ class EmojiRatingBot:
         if not self.assets:
             await message.answer("Папка assets пуста. Добавьте изображения эмодзи.")
             return
+
         filename = random.choice(self.assets)
         photo_source: str | FSInputFile = self.emote_file_ids.get(filename, FSInputFile(ASSETS_DIR / filename))
-        sent_message = await message.answer_photo(
-            photo=photo_source,
-            caption="Оцените эмодзи от 1 до 10:",
-            reply_markup=self._vote_keyboard(filename),
-        )
+        async with self.global_send_semaphore:
+            sent_message = await message.answer_photo(
+                photo=photo_source,
+                caption="Оцените эмодзи от 1 до 10:",
+                reply_markup=self._vote_keyboard(filename),
+            )
+
         if sent_message.photo:
             self.emote_file_ids[filename] = sent_message.photo[-1].file_id
 
@@ -153,7 +187,7 @@ class EmojiRatingBot:
         total_votes = await self.fetch_total_votes()
 
         async with self.cache_lock:
-            has_cache = bool(self.cache.file_ids or self.cache.local_paths)
+            has_cache = bool(self.cache.preview_file_id or self.cache.preview_path)
             unchanged = has_cache and total_votes == self.last_known_total_votes
             if unchanged:
                 now = datetime.now()
@@ -176,18 +210,25 @@ class EmojiRatingBot:
             else:
                 tiers["C"].append(emote)
 
+        # Тяжелые полные tier-картинки генерируем, но не рассылаем пользователям напрямую.
         tier_paths_map = await asyncio.to_thread(draw_tier_set, tiers, ASSETS_DIR, CACHE_DIR)
         ordered_paths = [tier_paths_map[key] for key in ("S", "A", "B", "C")]
 
-        new_file_ids: list[str] = []
+        # Легкая превью-картинка TOP для мгновенного /top
+        preview_path = await asyncio.to_thread(draw_top_preview, emotes, ASSETS_DIR, CACHE_DIR / "top_preview.jpg")
+
+        preview_file_id: str | None = None
         if CACHE_CHAT_ID:
-            media = [InputMediaPhoto(media=FSInputFile(path)) for path in ordered_paths]
-            sent_messages = await self.bot.send_media_group(chat_id=CACHE_CHAT_ID, media=media)
-            new_file_ids = [msg.photo[-1].file_id for msg in sent_messages if msg.photo]
+            async with self.global_send_semaphore:
+                sent = await self.bot.send_photo(chat_id=CACHE_CHAT_ID, photo=FSInputFile(preview_path))
+            if sent.photo:
+                preview_file_id = sent.photo[-1].file_id
 
         async with self.cache_lock:
             self.cache.local_paths = ordered_paths
-            self.cache.file_ids = new_file_ids
+            self.cache.file_ids = []
+            self.cache.preview_path = preview_path
+            self.cache.preview_file_id = preview_file_id
             self.cache.total_votes = total_votes
             self.cache.generated_at = datetime.now()
             self.cache.next_update_at = self.cache.generated_at + timedelta(minutes=CACHE_UPDATE_MINUTES)
@@ -213,20 +254,30 @@ async def cmd_start(message: Message) -> None:
         "Привет! Я бот рейтинга эмодзи Clash Royale.\n"
         "Команды:\n"
         "/vote — оценить случайный эмодзи\n"
-        "/top — посмотреть текущий рейтинг"
+        "/top — быстрый топ-превью рейтинг"
     )
 
 
 @router.message(Command("vote"))
 @router.message(F.text == "🎲 Оценить")
 async def cmd_vote(message: Message) -> None:
-    if service:
-        await service.send_random_vote(message)
+    if not service:
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    if not service.vote_rate_limiter.allow(user_id):
+        await message.answer("Слишком часто. Подождите пару секунд и попробуйте снова.")
+        return
+    await service.send_random_vote(message)
 
 
 @router.callback_query(F.data.startswith("rate:"))
 async def on_rate(callback: CallbackQuery) -> None:
     if not service or not callback.message:
+        return
+
+    user_id = callback.from_user.id if callback.from_user else 0
+    if not service.vote_rate_limiter.allow(user_id):
+        await callback.answer("Слишком часто. Немного подождите.", show_alert=False)
         return
 
     _, score_str, filename = callback.data.split(":", 2)
@@ -247,6 +298,11 @@ async def cmd_top(message: Message) -> None:
     if not service:
         return
 
+    user_id = message.from_user.id if message.from_user else 0
+    if not service.top_rate_limiter.allow(user_id):
+        await message.answer("/top сейчас вызывается слишком часто. Подождите немного.")
+        return
+
     async with service.cache_lock:
         cache_snapshot = TierCache(
             file_ids=list(service.cache.file_ids),
@@ -255,9 +311,11 @@ async def cmd_top(message: Message) -> None:
             next_update_at=service.cache.next_update_at,
             total_votes=service.cache.total_votes,
             skipped_regenerations=service.cache.skipped_regenerations,
+            preview_file_id=service.cache.preview_file_id,
+            preview_path=service.cache.preview_path,
         )
 
-    if not cache_snapshot.file_ids and not cache_snapshot.local_paths:
+    if not cache_snapshot.preview_file_id and not cache_snapshot.preview_path:
         await message.answer("Рейтинг еще не готов, попробуйте через минуту.")
         return
 
@@ -265,7 +323,7 @@ async def cmd_top(message: Message) -> None:
     next_update = cache_snapshot.next_update_at.strftime("%H:%M") if cache_snapshot.next_update_at else "-"
 
     caption = (
-        "🏆 Текущий рейтинг эмодзи\n"
+        "🏆 Текущий рейтинг эмодзи (быстрое превью)\n"
         f"🔄 Данные обновляются раз в {CACHE_UPDATE_MINUTES} минут.\n"
         f"🕒 Последнее обновление: {generated}\n"
         f"⏳ Следующее обновление: {next_update}\n\n"
@@ -273,15 +331,14 @@ async def cmd_top(message: Message) -> None:
         f"⚡ Пропущено пересборок без новых голосов: {cache_snapshot.skipped_regenerations}"
     )
 
-    media: list[InputMediaPhoto] = []
-    if cache_snapshot.file_ids:
-        media = [InputMediaPhoto(media=file_id) for file_id in cache_snapshot.file_ids]
+    photo: str | FSInputFile
+    if cache_snapshot.preview_file_id:
+        photo = cache_snapshot.preview_file_id
     else:
-        media = [InputMediaPhoto(media=FSInputFile(path)) for path in cache_snapshot.local_paths]
+        photo = FSInputFile(cache_snapshot.preview_path)
 
-    if media:
-        media[0].caption = caption
-        await message.answer_media_group(media=media)
+    async with service.global_send_semaphore:
+        await message.answer_photo(photo=photo, caption=caption)
 
 
 async def on_startup(bot: Bot) -> None:
