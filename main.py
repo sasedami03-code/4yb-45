@@ -32,6 +32,7 @@ class TierCache:
     generated_at: datetime | None = None
     next_update_at: datetime | None = None
     total_votes: int = 0
+    skipped_regenerations: int = 0
 
 
 class EmojiRatingBot:
@@ -43,6 +44,7 @@ class EmojiRatingBot:
         self.cache_lock = asyncio.Lock()
         self.refresh_task: asyncio.Task | None = None
         self.emote_file_ids: dict[str, str] = {}
+        self.last_known_total_votes: int = -1
 
     async def init(self) -> None:
         ASSETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,6 +150,19 @@ class EmojiRatingBot:
         return int(row[0] or 0)
 
     async def regenerate_cache(self) -> None:
+        total_votes = await self.fetch_total_votes()
+
+        async with self.cache_lock:
+            has_cache = bool(self.cache.file_ids or self.cache.local_paths)
+            unchanged = has_cache and total_votes == self.last_known_total_votes
+            if unchanged:
+                now = datetime.now()
+                self.cache.generated_at = now
+                self.cache.next_update_at = now + timedelta(minutes=CACHE_UPDATE_MINUTES)
+                self.cache.total_votes = total_votes
+                self.cache.skipped_regenerations += 1
+                return
+
         emotes = await self.fetch_sorted_emotes()
         tiers = {"S": [], "A": [], "B": [], "C": []}
         for emote in emotes:
@@ -163,7 +178,6 @@ class EmojiRatingBot:
 
         tier_paths_map = await asyncio.to_thread(draw_tier_set, tiers, ASSETS_DIR, CACHE_DIR)
         ordered_paths = [tier_paths_map[key] for key in ("S", "A", "B", "C")]
-        total_votes = await self.fetch_total_votes()
 
         new_file_ids: list[str] = []
         if CACHE_CHAT_ID:
@@ -177,6 +191,8 @@ class EmojiRatingBot:
             self.cache.total_votes = total_votes
             self.cache.generated_at = datetime.now()
             self.cache.next_update_at = self.cache.generated_at + timedelta(minutes=CACHE_UPDATE_MINUTES)
+            self.last_known_total_votes = total_votes
+            self.cache.skipped_regenerations = 0
 
     async def refresh_loop(self) -> None:
         while True:
@@ -215,13 +231,15 @@ async def on_rate(callback: CallbackQuery) -> None:
 
     _, score_str, filename = callback.data.split(":", 2)
     score = int(score_str)
-    avg = await service.add_vote(filename, score)
-    await callback.message.edit_caption(
-        caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-        reply_markup=None,
-    )
     await callback.answer("Голос сохранен")
-    await service.send_random_vote(callback.message)
+    avg = await service.add_vote(filename, score)
+    await asyncio.gather(
+        callback.message.edit_caption(
+            caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+            reply_markup=None,
+        ),
+        service.send_random_vote(callback.message),
+    )
 
 
 @router.message(Command("top"))
@@ -236,6 +254,7 @@ async def cmd_top(message: Message) -> None:
             generated_at=service.cache.generated_at,
             next_update_at=service.cache.next_update_at,
             total_votes=service.cache.total_votes,
+            skipped_regenerations=service.cache.skipped_regenerations,
         )
 
     if not cache_snapshot.file_ids and not cache_snapshot.local_paths:
@@ -250,7 +269,8 @@ async def cmd_top(message: Message) -> None:
         f"🔄 Данные обновляются раз в {CACHE_UPDATE_MINUTES} минут.\n"
         f"🕒 Последнее обновление: {generated}\n"
         f"⏳ Следующее обновление: {next_update}\n\n"
-        f"Всего голосов в базе: {cache_snapshot.total_votes}"
+        f"Всего голосов в базе: {cache_snapshot.total_votes}\n"
+        f"⚡ Пропущено пересборок без новых голосов: {cache_snapshot.skipped_regenerations}"
     )
 
     media: list[InputMediaPhoto] = []
