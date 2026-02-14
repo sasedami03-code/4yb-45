@@ -15,7 +15,7 @@ from pathlib import Path
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -823,6 +823,9 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
             logging.warning("Inline query просрочен: %s", exc)
             return
         raise
+    except TelegramNetworkError as exc:
+        logging.warning("Сетевая ошибка при ответе на inline query: %s", exc)
+        return
 
 
 
@@ -950,7 +953,13 @@ async def on_photo_scan(message: Message) -> None:
         await message.bot.download_file(file.file_path, destination=tmp.name)
         data = Path(tmp.name).read_bytes()
 
-    matches = await service.detect_by_photo(data, top_k=3)
+    try:
+        matches = await service.detect_by_photo(data, top_k=3)
+    except Exception:  # noqa: BLE001
+        logging.exception("Ошибка распознавания эмодзи по фото")
+        await message.answer("Не удалось обработать фото. Попробуйте отправить другой скрин чуть крупнее.")
+        return
+
     if not matches:
         await message.answer("Не смог распознать эмодзи на фото.")
         return
