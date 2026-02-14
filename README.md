@@ -8,6 +8,7 @@
 - Хранение голосов в SQLite (`database.db`):
   - `total_score`, `votes_count`, `average_rating`.
 - `/top [страница]` — выдача превью рейтинга с пагинацией и обновляемым кэшем.
+- Инлайн-режим (`@botname`, `@botname miner`) с карточками для голосования в любом чате.
 - Автопересборка кэша раз в `CACHE_UPDATE_MINUTES` минут.
 - Anti-spam лимиты:
   - на голосования,
@@ -33,7 +34,14 @@ python -m bot.main
 - `CACHE_UPDATE_MINUTES` (default: `1`)
 - `CACHE_CHAT_ID` (default: `0`, если указать — превью будут предварительно грузиться в этот чат и переиспользовать `file_id`)
 - `TOP_ITEMS_PER_PAGE` (default: `140`)
+- `INLINE_RESULTS_LIMIT` (default: `20`)
 
 ## Требования к ассетам
 
 Положите изображения эмодзи в `assets/` (png/jpg/jpeg/webp/ppm). При запуске они синхронизируются в БД.
+
+## Важно для inline-режима
+
+1. В `@BotFather` должна быть включена команда `/setinline`.
+2. После включения перезапустите бота.
+3. Используйте в чате: `@username_бота` или `@username_бота <поиск>`.

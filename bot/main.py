@@ -12,7 +12,17 @@ from pathlib import Path
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputMediaPhoto,
+    InputTextMessageContent,
+    Message,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 if __package__ in {None, ""}:
@@ -38,6 +48,7 @@ RATE_WINDOW_SECONDS = int(os.getenv("RATE_WINDOW_SECONDS", "10"))
 MAX_GLOBAL_CONCURRENT_SENDS = int(os.getenv("MAX_GLOBAL_CONCURRENT_SENDS", "20"))
 MAX_TOP_REQUESTS_PER_WINDOW = int(os.getenv("MAX_TOP_REQUESTS_PER_WINDOW", "3"))
 TOP_WINDOW_SECONDS = int(os.getenv("TOP_WINDOW_SECONDS", "20"))
+INLINE_RESULTS_LIMIT = int(os.getenv("INLINE_RESULTS_LIMIT", "20"))
 
 
 class EmojiRatingBot:
@@ -102,6 +113,29 @@ class EmojiRatingBot:
             kb.add(InlineKeyboardButton(text=str(score), callback_data=f"rate:{score}:{filename}"))
         kb.adjust(5)
         return kb.as_markup()
+
+    @staticmethod
+    def _display_name(filename: str) -> str:
+        stem = Path(filename).stem
+        return stem.replace("_", " ").replace("-", " ").title()
+
+    def search_assets(self, query: str, limit: int = INLINE_RESULTS_LIMIT) -> list[str]:
+        if not self.assets:
+            return []
+
+        q = query.strip().lower()
+        if not q:
+            shuffled = self.assets[:]
+            random.shuffle(shuffled)
+            return shuffled[:limit]
+
+        matched = [name for name in self.assets if q in Path(name).stem.lower() or q in name.lower()]
+        if matched:
+            return matched[:limit]
+
+        shuffled = self.assets[:]
+        random.shuffle(shuffled)
+        return shuffled[: min(limit, 5)]
 
     async def send_random_vote(self, message: Message) -> None:
         if not self.assets:
@@ -277,7 +311,8 @@ async def cmd_start(message: Message) -> None:
         "Привет! Я бот рейтинга эмодзи Clash Royale.\n"
         "Команды:\n"
         "/vote — оценить случайный эмодзи\n"
-        "/top [страница] — быстрый топ-превью рейтинг"
+        "/top [страница] — быстрый топ-превью рейтинг\n"
+        "Инлайн: @your_bot или @your_bot miner"
     )
 
 
@@ -291,6 +326,45 @@ async def cmd_vote(message: Message) -> None:
         await message.answer("Слишком часто. Подождите пару секунд и попробуйте снова.")
         return
     await service.send_random_vote(message)
+
+
+@router.inline_query()
+async def on_inline_query(inline_query: InlineQuery) -> None:
+    if not service:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+
+    found = service.search_assets(inline_query.query, limit=INLINE_RESULTS_LIMIT)
+    results: list[InlineQueryResultArticle] = []
+
+    for filename in found:
+        display_name = service._display_name(filename)
+        results.append(
+            InlineQueryResultArticle(
+                id=f"inline:{filename}",
+                title=f"🎲 {display_name}",
+                description="Отправить в чат и собрать оценки 1..10",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}"
+                ),
+                reply_markup=service._vote_keyboard(filename),
+            )
+        )
+
+    if not results:
+        results.append(
+            InlineQueryResultArticle(
+                id="inline:empty",
+                title="Нет подходящих эмодзи",
+                description="Добавьте файлы в assets/",
+                input_message_content=InputTextMessageContent(
+                    message_text="Не нашёл эмодзи по запросу. Попробуйте другой тег."
+                ),
+            )
+        )
+
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+
 
 
 @router.callback_query(F.data.startswith("rate:"))
@@ -309,10 +383,16 @@ async def on_rate(callback: CallbackQuery) -> None:
     avg = await service.add_vote(filename, score)
 
     next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
-    await callback.message.edit_caption(
-        caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-        reply_markup=None,
-    )
+    if callback.message.photo:
+        await callback.message.edit_caption(
+            caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+            reply_markup=None,
+        )
+    else:
+        await callback.message.edit_text(
+            text=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+            reply_markup=None,
+        )
     await next_vote_task
 
 
