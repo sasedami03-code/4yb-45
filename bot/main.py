@@ -15,8 +15,15 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .core import RateLimiter, TierCache, parse_top_page
-from .drawer import draw_tier_set, draw_top_preview
+if __package__ in {None, ""}:
+    import sys
+
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from bot.core import RateLimiter, TierCache, parse_top_page
+    from bot.drawer import draw_tier_set, draw_top_preview
+else:
+    from .core import RateLimiter, TierCache, parse_top_page
+    from .drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "assets"))
