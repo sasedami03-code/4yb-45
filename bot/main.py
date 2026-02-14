@@ -14,7 +14,7 @@ from pathlib import Path
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -67,6 +67,8 @@ class EmojiRatingBot:
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
         self.asset_hashes: dict[str, int] = {}
+        self.blocked_chat_ids: set[int] = set()
+        self.on_demand_warmup_tasks: dict[int, asyncio.Task] = {}
         self.global_send_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_SENDS)
         self.vote_rate_limiter = RateLimiter(MAX_UPDATES_PER_USER_WINDOW, RATE_WINDOW_SECONDS)
         self.top_rate_limiter = RateLimiter(MAX_TOP_REQUESTS_PER_WINDOW, TOP_WINDOW_SECONDS)
@@ -100,6 +102,12 @@ class EmojiRatingBot:
             self.refresh_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.refresh_task
+        for task in self.on_demand_warmup_tasks.values():
+            task.cancel()
+        for task in self.on_demand_warmup_tasks.values():
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self.on_demand_warmup_tasks.clear()
         if self.db:
             await self.db.close()
 
@@ -119,7 +127,7 @@ class EmojiRatingBot:
     @staticmethod
     def _ahash(image: Image.Image, size: int = 8) -> int:
         gray = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
-        pixels = list(gray.getdata())
+        pixels = list(gray.tobytes())
         avg = sum(pixels) / len(pixels)
         bits = 0
         for idx, px in enumerate(pixels):
@@ -176,6 +184,8 @@ class EmojiRatingBot:
             candidate_chats.append(user_chat_id)
 
         for chat_id in candidate_chats:
+            if chat_id in self.blocked_chat_ids:
+                continue
             try:
                 async with self.global_send_semaphore:
                     sent = await self.bot.send_photo(chat_id=chat_id, photo=FSInputFile(ASSETS_DIR / filename))
@@ -185,12 +195,29 @@ class EmojiRatingBot:
                     return file_id
             except TelegramBadRequest as exc:
                 msg = str(exc).lower()
-                if "chat not found" in msg or "bot can't initiate conversation" in msg or "forbidden" in msg:
+                if "chat not found" in msg or "forbidden" in msg:
+                    self.blocked_chat_ids.add(chat_id)
                     continue
                 logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
+            except TelegramForbiddenError:
+                self.blocked_chat_ids.add(chat_id)
+                continue
             except Exception:  # noqa: BLE001
                 logging.exception("Не удалось получить file_id для %s через chat_id=%s", filename, chat_id)
         return None
+
+    def schedule_on_demand_warmup(self, user_chat_id: int, filenames: list[str]) -> None:
+        task = self.on_demand_warmup_tasks.get(user_chat_id)
+        if task and not task.done():
+            return
+
+        async def _runner() -> None:
+            for name in filenames:
+                if name in self.emote_file_ids:
+                    continue
+                await self.ensure_file_id(name, user_chat_id)
+
+        self.on_demand_warmup_tasks[user_chat_id] = asyncio.create_task(_runner())
 
     def _vote_keyboard(self, filename: str) -> InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
@@ -441,9 +468,11 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
     found = service.search_assets(inline_query.query, limit=INLINE_RESULTS_LIMIT)
     results: list[InlineQueryResultArticle] = []
 
+    missing_for_user: list[str] = []
+
     for filename in found:
         display_name = service._display_name(filename)
-        file_id = await service.ensure_file_id(filename, inline_query.from_user.id if inline_query.from_user else None)
+        file_id = service.emote_file_ids.get(filename)
         if file_id:
             results.append(
                 InlineQueryResultCachedPhoto(
@@ -480,7 +509,16 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
             )
         )
 
-    await inline_query.answer(results, cache_time=1, is_personal=True)
+    if missing_for_user and inline_query.from_user:
+        service.schedule_on_demand_warmup(inline_query.from_user.id, missing_for_user[:5])
+
+    try:
+        await inline_query.answer(results, cache_time=1, is_personal=True)
+    except TelegramBadRequest as exc:
+        if "query is too old" in str(exc).lower() or "query id is invalid" in str(exc).lower():
+            logging.warning("Inline query просрочен: %s", exc)
+            return
+        raise
 
 
 
@@ -496,20 +534,31 @@ async def on_rate(callback: CallbackQuery) -> None:
 
     _, score_str, filename = callback.data.split(":", 2)
     score = int(score_str)
-    await callback.answer("Голос сохранен")
+    try:
+        await callback.answer("Голос сохранен")
+    except TelegramBadRequest as exc:
+        if "query is too old" in str(exc).lower() or "query id is invalid" in str(exc).lower():
+            logging.warning("Просроченный callback query для %s", filename)
+        else:
+            raise
+
     avg = await service.add_vote(filename, score)
 
     next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
-    if callback.message.photo:
-        await callback.message.edit_caption(
-            caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-            reply_markup=None,
-        )
-    else:
-        await callback.message.edit_text(
-            text=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
-            reply_markup=None,
-        )
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                text=f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}",
+                reply_markup=None,
+            )
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logging.warning("Не удалось обновить сообщение после голоса: %s", exc)
     await next_vote_task
 
 
