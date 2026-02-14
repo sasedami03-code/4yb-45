@@ -76,3 +76,13 @@ def parse_media_urls(lines: list[str]) -> tuple[dict[str, str], list[str]]:
         ordered.append(line)
 
     return by_name, ordered
+
+
+def parse_ordered_labels(lines: list[str]) -> list[str]:
+    labels: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        labels.append(line)
+    return labels

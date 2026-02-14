@@ -37,10 +37,10 @@ if __package__ in {None, ""}:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from bot.core import RateLimiter, TierCache, parse_media_urls, parse_top_page
+    from bot.core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
     from bot.drawer import draw_tier_set, draw_top_preview
 else:
-    from .core import RateLimiter, TierCache, parse_media_urls, parse_top_page
+    from .core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
     from .drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -59,6 +59,7 @@ TOP_WINDOW_SECONDS = int(os.getenv("TOP_WINDOW_SECONDS", "20"))
 INLINE_RESULTS_LIMIT = int(os.getenv("INLINE_RESULTS_LIMIT", "20"))
 EMOJI_URLS_FILE = os.getenv("EMOJI_URLS_FILE", "")
 EMOJI_URLS_START_INDEX = int(os.getenv("EMOJI_URLS_START_INDEX", "2"))
+EMOJI_LABELS_FILE = os.getenv("EMOJI_LABELS_FILE", "")
 
 
 class EmojiRatingBot:
@@ -73,6 +74,7 @@ class EmojiRatingBot:
         self.last_known_total_votes: int = -1
         self.asset_hashes: dict[str, int] = {}
         self.asset_urls: dict[str, str] = {}
+        self.asset_labels: dict[str, str] = {}
         self.blocked_chat_ids: set[int] = set()
         self.on_demand_warmup_tasks: dict[int, asyncio.Task] = {}
         self.global_send_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_SENDS)
@@ -100,6 +102,7 @@ class EmojiRatingBot:
         await self.db.commit()
         await self._sync_assets_to_db()
         self._load_asset_urls()
+        self._load_asset_labels()
         self._build_asset_hashes()
         if CACHE_CHAT_ID:
             await self._warmup_emote_file_ids()
@@ -186,6 +189,31 @@ class EmojiRatingBot:
             len(self.assets),
             EMOJI_URLS_START_INDEX,
         )
+
+    def _load_asset_labels(self) -> None:
+        self.asset_labels = {}
+        if not EMOJI_LABELS_FILE:
+            return
+
+        labels_path = Path(EMOJI_LABELS_FILE)
+        if not labels_path.exists():
+            logging.warning("EMOJI_LABELS_FILE не найден: %s", labels_path)
+            return
+
+        labels = parse_ordered_labels(labels_path.read_text(encoding="utf-8").splitlines())
+        indexed_assets: list[tuple[int, str]] = []
+        for filename in self.assets:
+            idx = self._emoji_index(filename)
+            if idx is not None:
+                indexed_assets.append((idx, filename))
+        indexed_assets.sort(key=lambda x: x[0])
+
+        for idx_value, filename in indexed_assets:
+            pos = idx_value - EMOJI_URLS_START_INDEX
+            if 0 <= pos < len(labels):
+                self.asset_labels[filename] = labels[pos]
+
+        logging.info("Загружено названий эмодзи: %s/%s", len(self.asset_labels), len(self.assets))
 
     @staticmethod
     def _ahash(image: Image.Image, size: int = 8) -> int:
@@ -319,8 +347,10 @@ class EmojiRatingBot:
         kb.adjust(5)
         return kb.as_markup()
 
-    @staticmethod
-    def _display_name(filename: str) -> str:
+    def _display_name(self, filename: str) -> str:
+        label = self.asset_labels.get(filename)
+        if label:
+            return label
         stem = Path(filename).stem
         return stem.replace("_", " ").replace("-", " ").title()
 
@@ -669,28 +699,26 @@ async def on_rate(callback: CallbackQuery) -> None:
                 await callback.bot.edit_message_caption(
                     inline_message_id=callback.inline_message_id,
                     caption=result_text,
-                    reply_markup=None,
+                    reply_markup=service._vote_keyboard(filename),
                 )
             except TelegramBadRequest:
                 await callback.bot.edit_message_text(
                     inline_message_id=callback.inline_message_id,
                     text=result_text,
-                    reply_markup=None,
+                    reply_markup=service._vote_keyboard(filename),
                 )
         elif callback.message:
             # Голосование в обычном /vote потоке
-            next_vote_task = asyncio.create_task(service.send_random_vote(callback.message))
             if callback.message.photo:
                 await callback.message.edit_caption(
                     caption=result_text,
-                    reply_markup=None,
+                    reply_markup=service._vote_keyboard(filename),
                 )
             else:
                 await callback.message.edit_text(
                     text=result_text,
-                    reply_markup=None,
+                    reply_markup=service._vote_keyboard(filename),
                 )
-            await next_vote_task
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             logging.warning("Не удалось обновить сообщение после голоса: %s", exc)

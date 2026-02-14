@@ -36,7 +36,8 @@ python -m bot.main
 - `TOP_ITEMS_PER_PAGE` (default: `140`)
 - `INLINE_RESULTS_LIMIT` (default: `20`)
 - `EMOJI_URLS_FILE` (default: пусто, путь к txt с URL изображений для inline-режима)
-- `EMOJI_URLS_START_INDEX` (default: `2`, если URL в файле идут по порядку начиная с `emoji_002`)
+- `EMOJI_URLS_START_INDEX` (default: `2`, если URL/названия в файле идут по порядку начиная с `emoji_002`)
+- `EMOJI_LABELS_FILE` (default: пусто, путь к txt с названиями эмодзи по порядку)
 
 ## Требования к ассетам
 
@@ -82,3 +83,8 @@ python -m bot.main
 
 
 Привязка URL по порядку: при `EMOJI_URLS_START_INDEX=2` первая ссылка в файле соответствует `emoji_002`, вторая — `emoji_003` и т.д.
+
+
+### Поиск по названиям
+
+Если у вас есть файл с названиями в том же порядке, укажите `EMOJI_LABELS_FILE`. Тогда inline-поиск будет учитывать эти названия, а в карточках покажется реальное имя эмодзи.

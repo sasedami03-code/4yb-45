@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from bot.core import RateLimiter, parse_media_urls, parse_top_page
+from bot.core import RateLimiter, parse_media_urls, parse_ordered_labels, parse_top_page
 
 
 def test_parse_top_page_defaults_to_1():
@@ -51,3 +51,13 @@ def test_parse_media_urls_plain_order():
     ])
     assert by_name == {}
     assert ordered == ['https://example.com/2.png', 'https://example.com/3.png']
+
+
+def test_parse_ordered_labels():
+    labels = parse_ordered_labels([
+        '# comment',
+        '  ',
+        'Король',
+        'Скелет',
+    ])
+    assert labels == ['Король', 'Скелет']
