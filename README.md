@@ -32,7 +32,7 @@ python -m bot.main
 - `DATABASE_PATH` (default: `database.db`)
 - `CACHE_DIR` (default: `cache`)
 - `CACHE_UPDATE_MINUTES` (default: `1`)
-- `CACHE_CHAT_ID` (default: `0`, если указать — превью будут предварительно грузиться в этот чат и переиспользовать `file_id`)
+- `CACHE_CHAT_ID` (default: `0`, укажите chat_id канала/чата для прогрева `file_id`, чтобы inline отправлял именно фото, а не только текст)
 - `TOP_ITEMS_PER_PAGE` (default: `140`)
 - `INLINE_RESULTS_LIMIT` (default: `20`)
 
@@ -45,3 +45,8 @@ python -m bot.main
 1. В `@BotFather` должна быть включена команда `/setinline`.
 2. После включения перезапустите бота.
 3. Используйте в чате: `@username_бота` или `@username_бота <поиск>`.
+
+
+## Определение эмодзи по фото
+
+Отправьте скрин магазина боту как фото. Бот сравнит изображение с ассетами и пришлёт топ-3 совпадения с текущим рейтингом из базы.

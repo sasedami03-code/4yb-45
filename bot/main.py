@@ -6,7 +6,9 @@ import logging
 import math
 import os
 import random
+import tempfile
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 import aiosqlite
@@ -19,11 +21,13 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
+    InlineQueryResultCachedPhoto,
     InputMediaPhoto,
     InputTextMessageContent,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from PIL import Image
 
 if __package__ in {None, ""}:
     import sys
@@ -61,6 +65,7 @@ class EmojiRatingBot:
         self.refresh_task: asyncio.Task | None = None
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
+        self.asset_hashes: dict[str, int] = {}
         self.global_send_semaphore = asyncio.Semaphore(MAX_GLOBAL_CONCURRENT_SENDS)
         self.vote_rate_limiter = RateLimiter(MAX_UPDATES_PER_USER_WINDOW, RATE_WINDOW_SECONDS)
         self.top_rate_limiter = RateLimiter(MAX_TOP_REQUESTS_PER_WINDOW, TOP_WINDOW_SECONDS)
@@ -85,6 +90,9 @@ class EmojiRatingBot:
         )
         await self.db.commit()
         await self._sync_assets_to_db()
+        self._build_asset_hashes()
+        if CACHE_CHAT_ID:
+            await self._warmup_emote_file_ids()
 
     async def close(self) -> None:
         if self.refresh_task:
@@ -106,6 +114,43 @@ class EmojiRatingBot:
         for filename in files:
             await self.db.execute("INSERT OR IGNORE INTO emotes(filename) VALUES (?)", (filename,))
         await self.db.commit()
+
+    @staticmethod
+    def _ahash(image: Image.Image, size: int = 8) -> int:
+        gray = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
+        pixels = list(gray.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = 0
+        for idx, px in enumerate(pixels):
+            if px >= avg:
+                bits |= 1 << idx
+        return bits
+
+    @staticmethod
+    def _hamming(a: int, b: int) -> int:
+        return (a ^ b).bit_count()
+
+    def _build_asset_hashes(self) -> None:
+        self.asset_hashes.clear()
+        for filename in self.assets:
+            path = ASSETS_DIR / filename
+            try:
+                with Image.open(path) as img:
+                    self.asset_hashes[filename] = self._ahash(img)
+            except OSError:
+                continue
+
+    async def _warmup_emote_file_ids(self) -> None:
+        for filename in self.assets:
+            if filename in self.emote_file_ids:
+                continue
+            try:
+                async with self.global_send_semaphore:
+                    sent = await self.bot.send_photo(chat_id=CACHE_CHAT_ID, photo=FSInputFile(ASSETS_DIR / filename))
+                if sent.photo:
+                    self.emote_file_ids[filename] = sent.photo[-1].file_id
+            except Exception:  # noqa: BLE001
+                logging.exception("Не удалось прогреть file_id для %s", filename)
 
     def _vote_keyboard(self, filename: str) -> InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
@@ -136,6 +181,25 @@ class EmojiRatingBot:
         shuffled = self.assets[:]
         random.shuffle(shuffled)
         return shuffled[: min(limit, 5)]
+
+    async def detect_by_photo(self, image_bytes: bytes, top_k: int = 3) -> list[tuple[str, float]]:
+        if not self.asset_hashes:
+            return []
+
+        try:
+            with Image.open(BytesIO(image_bytes)) as img:
+                query_hash = self._ahash(img)
+        except OSError:
+            return []
+
+        scored: list[tuple[str, float]] = []
+        for filename, h in self.asset_hashes.items():
+            dist = self._hamming(query_hash, h)
+            similarity = max(0.0, 1.0 - (dist / 64.0))
+            scored.append((filename, similarity))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
         if not self.assets:
@@ -339,17 +403,30 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
 
     for filename in found:
         display_name = service._display_name(filename)
-        results.append(
-            InlineQueryResultArticle(
-                id=f"inline:{filename}",
-                title=f"🎲 {display_name}",
-                description="Отправить в чат и собрать оценки 1..10",
-                input_message_content=InputTextMessageContent(
-                    message_text=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}"
-                ),
-                reply_markup=service._vote_keyboard(filename),
+        file_id = service.emote_file_ids.get(filename)
+        if file_id:
+            results.append(
+                InlineQueryResultCachedPhoto(
+                    id=f"inline-photo:{filename}",
+                    photo_file_id=file_id,
+                    title=f"🎲 {display_name}",
+                    description="Отправить фото и собрать оценки 1..10",
+                    caption=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}",
+                    reply_markup=service._vote_keyboard(filename),
+                )
             )
-        )
+        else:
+            results.append(
+                InlineQueryResultArticle(
+                    id=f"inline-text:{filename}",
+                    title=f"🎲 {display_name}",
+                    description="Пока без превью фото (укажите CACHE_CHAT_ID для прогрева)",
+                    input_message_content=InputTextMessageContent(
+                        message_text=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}"
+                    ),
+                    reply_markup=service._vote_keyboard(filename),
+                )
+            )
 
     if not results:
         results.append(
@@ -442,6 +519,42 @@ async def cmd_top(message: Message) -> None:
 
     async with service.global_send_semaphore:
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
+
+
+@router.message(F.photo)
+async def on_photo_scan(message: Message) -> None:
+    if not service or not message.photo:
+        return
+
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
+        await message.bot.download_file(file.file_path, destination=tmp.name)
+        data = Path(tmp.name).read_bytes()
+
+    matches = await service.detect_by_photo(data, top_k=3)
+    if not matches:
+        await message.answer("Не смог распознать эмодзи на фото.")
+        return
+
+    lines = ["🛒 Анализ скрина:"]
+    if not service.db:
+        await message.answer("\n".join(lines))
+        return
+
+    for filename, sim in matches:
+        async with service.db.execute(
+            "SELECT average_rating, votes_count FROM emotes WHERE filename = ?", (filename,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        rating = float(row[0] or 0.0) if row else 0.0
+        votes = int(row[1] or 0) if row else 0
+        verdict = "🔥 НАДО БРАТЬ" if rating >= 8 else "👍 норм" if rating >= 6 else "🗑 мусор"
+        lines.append(
+            f"• {service._display_name(filename)}: {rating:.2f}/10 ({votes} голосов), совпадение {sim*100:.1f}% — {verdict}"
+        )
+
+    await message.answer("\n".join(lines))
 
 
 @router.callback_query(F.data.startswith("top_page:"))
