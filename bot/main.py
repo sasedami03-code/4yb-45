@@ -31,7 +31,7 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 if __package__ in {None, ""}:
     import sys
@@ -91,6 +91,7 @@ class EmojiRatingBot:
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
         self.asset_fingerprints: dict[str, EmojiFingerprint] = {}
+        self.asset_thumbnails: dict[str, Image.Image] = {}
         self.asset_urls: dict[str, str] = {}
         self.asset_labels: dict[str, str] = {}
         self.blocked_chat_ids: set[int] = set()
@@ -244,11 +245,14 @@ class EmojiRatingBot:
 
     def _build_asset_fingerprints(self) -> None:
         self.asset_fingerprints.clear()
+        self.asset_thumbnails.clear()
         for filename in self.assets:
             path = ASSETS_DIR / filename
             try:
                 with Image.open(path) as img:
-                    self.asset_fingerprints[filename] = build_emoji_fingerprint(img)
+                    normalized = img.convert("RGB")
+                    self.asset_fingerprints[filename] = build_emoji_fingerprint(normalized)
+                    self.asset_thumbnails[filename] = normalized.resize((64, 64), Image.Resampling.LANCZOS)
             except OSError:
                 continue
 
@@ -425,7 +429,19 @@ class EmojiRatingBot:
         area_b = max(1, (bx2 - bx1) * (by2 - by1))
         return inter / (area_a + area_b - inter)
 
-    def _best_asset_for_fingerprint(self, query_fp: EmojiFingerprint, shortlist: int = 48) -> tuple[str | None, float]:
+    @staticmethod
+    def _thumbnail_similarity(query_image: Image.Image, asset_thumb: Image.Image) -> float:
+        query_thumb = query_image.convert("RGB").resize((64, 64), Image.Resampling.LANCZOS)
+        diff = ImageChops.difference(query_thumb, asset_thumb)
+        mean_abs = sum(ImageStat.Stat(diff).mean) / 3.0
+        return max(0.0, 1.0 - (mean_abs / 255.0))
+
+    def _best_asset_for_fingerprint(
+        self,
+        query_fp: EmojiFingerprint,
+        query_image: Image.Image | None = None,
+        shortlist: int = 64,
+    ) -> tuple[str | None, float]:
         if not self.asset_fingerprints:
             return None, 0.0
 
@@ -438,7 +454,11 @@ class EmojiRatingBot:
 
         ranked: list[tuple[float, str]] = []
         for _, filename in color_ranked[:shortlist]:
-            score = emoji_similarity_score(query_fp, self.asset_fingerprints[filename])
+            forensic_score = emoji_similarity_score(query_fp, self.asset_fingerprints[filename])
+            score = forensic_score
+            if query_image is not None and filename in self.asset_thumbnails:
+                thumb_score = self._thumbnail_similarity(query_image, self.asset_thumbnails[filename])
+                score = (forensic_score * 0.72) + (thumb_score * 0.28)
             ranked.append((score, filename))
 
         if not ranked:
@@ -448,10 +468,10 @@ class EmojiRatingBot:
         best_score, best_name = ranked[0]
         second_score = ranked[1][0] if len(ranked) > 1 else 0.0
 
-        # Защита от ложных совпадений: нужен хороший абсолютный скор и отрыв от 2-го места
-        if best_score < 0.88:
+        # Защита от ложных совпадений: нужен хороший абсолютный скор и отрыв от 2-го места.
+        if best_score < 0.80:
             return None, 0.0
-        if (best_score - second_score) < 0.03:
+        if (best_score - second_score) < 0.012 and best_score < 0.93:
             return None, 0.0
 
         return best_name, best_score
@@ -481,8 +501,8 @@ class EmojiRatingBot:
                         x += step
                         continue
                     fp = build_emoji_fingerprint(crop)
-                    filename, score = self._best_asset_for_fingerprint(fp)
-                    if filename and score >= 0.88:
+                    filename, score = self._best_asset_for_fingerprint(fp, crop)
+                    if filename and score >= 0.80:
                         candidates.append((score, filename, box))
                     x += step
                 y += step
@@ -514,7 +534,7 @@ class EmojiRatingBot:
             with Image.open(BytesIO(image_bytes)) as img:
                 rgb = img.convert("RGB")
                 whole_fp = build_emoji_fingerprint(rgb)
-                whole_name, whole_score = self._best_asset_for_fingerprint(whole_fp)
+                whole_name, whole_score = self._best_asset_for_fingerprint(whole_fp, rgb)
                 multi = self._detect_multi_candidates(rgb, max_regions=top_k)
         except OSError:
             return []
@@ -523,14 +543,14 @@ class EmojiRatingBot:
         if multi:
             results.extend(multi)
 
-        if whole_name and whole_score >= 0.9 and all(name != whole_name for name, _ in results):
+        if whole_name and whole_score >= 0.82 and all(name != whole_name for name, _ in results):
             results.append((whole_name, whole_score))
 
         results.sort(key=lambda x: x[1], reverse=True)
-        filtered = [(name, score) for name, score in results if score >= 0.9]
+        filtered = [(name, score) for name, score in results if score >= 0.82]
         if len(filtered) >= 2:
             best = filtered[0][1]
-            filtered = [item for item in filtered if (best - item[1]) <= 0.12]
+            filtered = [item for item in filtered if (best - item[1]) <= 0.16]
         return filtered[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
