@@ -31,7 +31,7 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image
+from PIL import Image, ImageStat
 
 if __package__ in {None, ""}:
     import sys
@@ -401,6 +401,14 @@ class EmojiRatingBot:
         return [name for _, name in scored[:limit]]
 
     @staticmethod
+    def _region_is_informative(region: Image.Image) -> bool:
+        hsv = region.convert("HSV")
+        h, s, v = hsv.split()
+        sat_mean = ImageStat.Stat(s).mean[0]
+        val_std = ImageStat.Stat(v).stddev[0]
+        return sat_mean >= 18 or val_std >= 20
+
+    @staticmethod
     def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
         ax1, ay1, ax2, ay2 = a
         bx1, by1, bx2, by2 = b
@@ -459,9 +467,12 @@ class EmojiRatingBot:
                 while x + win <= width:
                     box = (x, y, x + win, y + win)
                     crop = rgb.crop(box)
+                    if not self._region_is_informative(crop):
+                        x += step
+                        continue
                     fp = build_emoji_fingerprint(crop)
                     filename, score = self._best_asset_for_fingerprint(fp)
-                    if filename and score >= 0.72:
+                    if filename and score >= 0.81:
                         candidates.append((score, filename, box))
                     x += step
                 y += step
@@ -502,11 +513,15 @@ class EmojiRatingBot:
         if multi:
             results.extend(multi)
 
-        if whole_name and all(name != whole_name for name, _ in results):
+        if whole_name and whole_score >= 0.84 and all(name != whole_name for name, _ in results):
             results.append((whole_name, whole_score))
 
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        filtered = [(name, score) for name, score in results if score >= 0.84]
+        if len(filtered) >= 2:
+            best = filtered[0][1]
+            filtered = [item for item in filtered if (best - item[1]) <= 0.18]
+        return filtered[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
         if not self.assets:
