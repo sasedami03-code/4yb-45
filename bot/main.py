@@ -14,6 +14,7 @@ from pathlib import Path
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -141,6 +142,9 @@ class EmojiRatingBot:
                 continue
 
     async def _warmup_emote_file_ids(self) -> None:
+        if not CACHE_CHAT_ID:
+            return
+
         for filename in self.assets:
             if filename in self.emote_file_ids:
                 continue
@@ -149,6 +153,15 @@ class EmojiRatingBot:
                     sent = await self.bot.send_photo(chat_id=CACHE_CHAT_ID, photo=FSInputFile(ASSETS_DIR / filename))
                 if sent.photo:
                     self.emote_file_ids[filename] = sent.photo[-1].file_id
+            except TelegramBadRequest as exc:
+                if "chat not found" in str(exc).lower():
+                    logging.error(
+                        "CACHE_CHAT_ID=%s недоступен (chat not found). Inline продолжит работать в текстовом fallback-режиме. "
+                        "Укажите корректный chat_id и добавьте туда бота.",
+                        CACHE_CHAT_ID,
+                    )
+                    return
+                logging.exception("Не удалось прогреть file_id для %s", filename)
             except Exception:  # noqa: BLE001
                 logging.exception("Не удалось прогреть file_id для %s", filename)
 
@@ -420,7 +433,7 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
                 InlineQueryResultArticle(
                     id=f"inline-text:{filename}",
                     title=f"🎲 {display_name}",
-                    description="Пока без превью фото (укажите CACHE_CHAT_ID для прогрева)",
+                    description="Пока без превью фото (проверьте CACHE_CHAT_ID и доступ бота в чат)",
                     input_message_content=InputTextMessageContent(
                         message_text=f"🎲 Оцените эмодзи: {display_name}\nФайл: {filename}"
                     ),
