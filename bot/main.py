@@ -99,6 +99,15 @@ class EmojiRatingBot:
             )
             """
         )
+        await self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vote_locks (
+                target_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY (target_key, user_id)
+            )
+            """
+        )
         await self.db.commit()
         await self._sync_assets_to_db()
         self._load_asset_urls()
@@ -442,6 +451,31 @@ class EmojiRatingBot:
         await self.db.commit()
         return float(row[0]) if row else 0.0
 
+    async def get_average_rating(self, filename: str) -> float:
+        if not self.db:
+            return 0.0
+        async with self.db.execute("SELECT average_rating FROM emotes WHERE filename = ?", (filename,)) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    async def add_vote_once(self, filename: str, score: int, user_id: int, target_key: str) -> tuple[bool, float]:
+        if not self.db:
+            raise RuntimeError("DB is not initialized")
+
+        async with self.db.execute(
+            "INSERT OR IGNORE INTO vote_locks(target_key, user_id) VALUES (?, ?)",
+            (target_key, user_id),
+        ) as cursor:
+            inserted = cursor.rowcount and cursor.rowcount > 0
+
+        if not inserted:
+            await self.db.commit()
+            avg = await self.get_average_rating(filename)
+            return False, avg
+
+        avg = await self.add_vote(filename, score)
+        return True, avg
+
     async def fetch_sorted_emotes(self) -> list[dict]:
         if not self.db:
             return []
@@ -705,8 +739,18 @@ async def on_rate(callback: CallbackQuery) -> None:
         else:
             raise
 
-    avg = await service.add_vote(filename, score)
-    result_text = f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}"
+    if callback.inline_message_id:
+        target_key = f"inline:{callback.inline_message_id}"
+    elif callback.message:
+        target_key = f"chat:{callback.message.chat.id}:msg:{callback.message.message_id}"
+    else:
+        target_key = f"fallback:{filename}"
+
+    saved, avg = await service.add_vote_once(filename, score, user_id, target_key)
+    if saved:
+        result_text = f"Принято! Ваша оценка: {score}. Средний рейтинг: {avg:.2f}"
+    else:
+        result_text = f"Вы уже голосовали за этот эмодзи. Текущий средний рейтинг: {avg:.2f}"
 
     try:
         if callback.inline_message_id:
