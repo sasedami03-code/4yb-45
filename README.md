@@ -36,6 +36,7 @@ python -m bot.main
 - `TOP_ITEMS_PER_PAGE` (default: `140`)
 - `INLINE_RESULTS_LIMIT` (default: `20`)
 - `EMOJI_URLS_FILE` (default: пусто, путь к txt с URL изображений для inline-режима)
+- `EMOJI_URLS_START_INDEX` (default: `2`, если URL в файле идут по порядку начиная с `emoji_002`)
 
 ## Требования к ассетам
 
@@ -78,3 +79,6 @@ python -m bot.main
 - только URL (тогда URL назначаются по порядку отсортированных файлов из `assets/`)
 - `filename,url`
 - `filename|url`
+
+
+Привязка URL по порядку: при `EMOJI_URLS_START_INDEX=2` первая ссылка в файле соответствует `emoji_002`, вторая — `emoji_003` и т.д.

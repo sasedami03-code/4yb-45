@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import re
 import tempfile
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -57,6 +58,7 @@ MAX_TOP_REQUESTS_PER_WINDOW = int(os.getenv("MAX_TOP_REQUESTS_PER_WINDOW", "3"))
 TOP_WINDOW_SECONDS = int(os.getenv("TOP_WINDOW_SECONDS", "20"))
 INLINE_RESULTS_LIMIT = int(os.getenv("INLINE_RESULTS_LIMIT", "20"))
 EMOJI_URLS_FILE = os.getenv("EMOJI_URLS_FILE", "")
+EMOJI_URLS_START_INDEX = int(os.getenv("EMOJI_URLS_START_INDEX", "2"))
 
 
 class EmojiRatingBot:
@@ -129,6 +131,13 @@ class EmojiRatingBot:
             await self.db.execute("INSERT OR IGNORE INTO emotes(filename) VALUES (?)", (filename,))
         await self.db.commit()
 
+    @staticmethod
+    def _emoji_index(filename: str) -> int | None:
+        match = re.search(r"emoji_(\d+)", Path(filename).stem.lower())
+        if not match:
+            return None
+        return int(match.group(1))
+
     def _load_asset_urls(self) -> None:
         self.asset_urls = {}
         if not EMOJI_URLS_FILE:
@@ -145,11 +154,38 @@ class EmojiRatingBot:
                 self.asset_urls[filename] = by_name[filename]
 
         missing = [name for name in self.assets if name not in self.asset_urls]
-        for idx, filename in enumerate(missing):
-            if idx < len(ordered):
-                self.asset_urls[filename] = ordered[idx]
 
-        logging.info("Загружено URL для inline: %s/%s", len(self.asset_urls), len(self.assets))
+        indexed_missing: list[tuple[int, str]] = []
+        plain_missing: list[str] = []
+        for filename in missing:
+            idx = self._emoji_index(filename)
+            if idx is None:
+                plain_missing.append(filename)
+            else:
+                indexed_missing.append((idx, filename))
+
+        indexed_missing.sort(key=lambda x: x[0])
+
+        # Режим по порядку ссылок: url[0] -> emoji_{START_INDEX}
+        for idx_value, filename in indexed_missing:
+            ordered_pos = idx_value - EMOJI_URLS_START_INDEX
+            if 0 <= ordered_pos < len(ordered):
+                self.asset_urls[filename] = ordered[ordered_pos]
+
+        # Фоллбек для файлов без номера emoji_NNN
+        remaining_urls = [u for i, u in enumerate(ordered) if i >= 0]
+        for filename in plain_missing:
+            if filename in self.asset_urls:
+                continue
+            if remaining_urls:
+                self.asset_urls[filename] = remaining_urls.pop(0)
+
+        logging.info(
+            "Загружено URL для inline: %s/%s (START_INDEX=%s)",
+            len(self.asset_urls),
+            len(self.assets),
+            EMOJI_URLS_START_INDEX,
+        )
 
     @staticmethod
     def _ahash(image: Image.Image, size: int = 8) -> int:

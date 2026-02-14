@@ -42,3 +42,12 @@ def test_parse_media_urls_mixed_formats():
     assert ordered == ["https://example.com/1.png"]
     assert by_name["emoji_001.png"] == "https://example.com/2.png"
     assert by_name["emoji_002.png"] == "https://example.com/3.png"
+
+
+def test_parse_media_urls_plain_order():
+    by_name, ordered = parse_media_urls([
+        'https://example.com/2.png',
+        'https://example.com/3.png',
+    ])
+    assert by_name == {}
+    assert ordered == ['https://example.com/2.png', 'https://example.com/3.png']
