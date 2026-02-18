@@ -15,7 +15,7 @@ from pathlib import Path
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -31,16 +31,37 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
+
+_RESAMPLING = getattr(Image, "Resampling", Image)
+_LANCZOS = _RESAMPLING.LANCZOS
 
 if __package__ in {None, ""}:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parent.parent))
-    from bot.core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
+    from bot.core import (
+        RateLimiter,
+        TierCache,
+        EmojiFingerprint,
+        build_emoji_fingerprint,
+        emoji_similarity_score,
+        parse_media_urls,
+        parse_ordered_labels,
+        parse_top_page,
+    )
     from bot.drawer import draw_tier_set, draw_top_preview
 else:
-    from .core import RateLimiter, TierCache, parse_media_urls, parse_ordered_labels, parse_top_page
+    from .core import (
+        RateLimiter,
+        TierCache,
+        EmojiFingerprint,
+        build_emoji_fingerprint,
+        emoji_similarity_score,
+        parse_media_urls,
+        parse_ordered_labels,
+        parse_top_page,
+    )
     from .drawer import draw_tier_set, draw_top_preview
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -72,7 +93,8 @@ class EmojiRatingBot:
         self.refresh_task: asyncio.Task | None = None
         self.emote_file_ids: dict[str, str] = {}
         self.last_known_total_votes: int = -1
-        self.asset_hashes: dict[str, int] = {}
+        self.asset_fingerprints: dict[str, EmojiFingerprint] = {}
+        self.asset_thumbnails: dict[str, Image.Image] = {}
         self.asset_urls: dict[str, str] = {}
         self.asset_labels: dict[str, str] = {}
         self.blocked_chat_ids: set[int] = set()
@@ -112,7 +134,7 @@ class EmojiRatingBot:
         await self._sync_assets_to_db()
         self._load_asset_urls()
         self._load_asset_labels()
-        self._build_asset_hashes()
+        self._build_asset_fingerprints()
         if CACHE_CHAT_ID:
             await self._warmup_emote_file_ids()
 
@@ -224,28 +246,16 @@ class EmojiRatingBot:
 
         logging.info("Загружено названий эмодзи: %s/%s", len(self.asset_labels), len(self.assets))
 
-    @staticmethod
-    def _ahash(image: Image.Image, size: int = 8) -> int:
-        gray = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
-        pixels = list(gray.tobytes())
-        avg = sum(pixels) / len(pixels)
-        bits = 0
-        for idx, px in enumerate(pixels):
-            if px >= avg:
-                bits |= 1 << idx
-        return bits
-
-    @staticmethod
-    def _hamming(a: int, b: int) -> int:
-        return (a ^ b).bit_count()
-
-    def _build_asset_hashes(self) -> None:
-        self.asset_hashes.clear()
+    def _build_asset_fingerprints(self) -> None:
+        self.asset_fingerprints.clear()
+        self.asset_thumbnails.clear()
         for filename in self.assets:
             path = ASSETS_DIR / filename
             try:
                 with Image.open(path) as img:
-                    self.asset_hashes[filename] = self._ahash(img)
+                    normalized = img.convert("RGB")
+                    self.asset_fingerprints[filename] = build_emoji_fingerprint(normalized)
+                    self.asset_thumbnails[filename] = normalized.resize((64, 64), _LANCZOS)
             except OSError:
                 continue
 
@@ -397,24 +407,154 @@ class EmojiRatingBot:
         scored.sort(key=lambda x: (-x[0], x[1]))
         return [name for _, name in scored[:limit]]
 
+    @staticmethod
+    def _region_is_informative(region: Image.Image) -> bool:
+        hsv = region.convert("HSV")
+        h, s, v = hsv.split()
+        sat_mean = ImageStat.Stat(s).mean[0]
+        val_std = ImageStat.Stat(v).stddev[0]
+        return sat_mean >= 18 or val_std >= 20
+
+    @staticmethod
+    def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        iw = max(0, inter_x2 - inter_x1)
+        ih = max(0, inter_y2 - inter_y1)
+        inter = iw * ih
+        if inter == 0:
+            return 0.0
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return inter / (area_a + area_b - inter)
+
+    @staticmethod
+    def _thumbnail_similarity(query_image: Image.Image, asset_thumb: Image.Image) -> float:
+        query_thumb = query_image.convert("RGB").resize((64, 64), _LANCZOS)
+        diff = ImageChops.difference(query_thumb, asset_thumb)
+        mean_abs = sum(ImageStat.Stat(diff).mean) / 3.0
+        return max(0.0, 1.0 - (mean_abs / 255.0))
+
+    def _best_asset_for_fingerprint(
+        self,
+        query_fp: EmojiFingerprint,
+        query_image: Image.Image | None = None,
+        shortlist: int = 64,
+    ) -> tuple[str | None, float]:
+        if not self.asset_fingerprints:
+            return None, 0.0
+
+        # Быстрый префильтр по близости цветового профиля
+        color_ranked: list[tuple[float, str]] = []
+        for filename, asset_fp in self.asset_fingerprints.items():
+            diff = sum(abs(a - b) for a, b in zip(query_fp.color_hist, asset_fp.color_hist)) / 2.0
+            color_ranked.append((diff, filename))
+        color_ranked.sort(key=lambda x: x[0])
+
+        ranked: list[tuple[float, str]] = []
+        for _, filename in color_ranked[:shortlist]:
+            forensic_score = emoji_similarity_score(query_fp, self.asset_fingerprints[filename])
+            score = forensic_score
+            if query_image is not None and filename in self.asset_thumbnails:
+                thumb_score = self._thumbnail_similarity(query_image, self.asset_thumbnails[filename])
+                score = (forensic_score * 0.72) + (thumb_score * 0.28)
+            ranked.append((score, filename))
+
+        if not ranked:
+            return None, 0.0
+
+        ranked.sort(reverse=True)
+        best_score, best_name = ranked[0]
+        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+
+        # Защита от ложных совпадений: нужен хороший абсолютный скор и отрыв от 2-го места.
+        if best_score < 0.80:
+            return None, 0.0
+        if (best_score - second_score) < 0.012 and best_score < 0.93:
+            return None, 0.0
+
+        return best_name, best_score
+
+    def _detect_multi_candidates(self, image: Image.Image, max_regions: int = 3) -> list[tuple[str, float]]:
+        width, height = image.size
+        if width < 64 or height < 64:
+            return []
+
+        rgb = image.convert("RGB")
+        min_side = min(width, height)
+        scales = (0.12, 0.16, 0.2, 0.24, 0.28, 0.34)
+
+        candidates: list[tuple[float, str, tuple[int, int, int, int]]] = []
+        for scale in scales:
+            win = int(min_side * scale)
+            if win < 48:
+                continue
+            step = max(18, win // 3)
+            y = 0
+            while y + win <= height:
+                x = 0
+                while x + win <= width:
+                    box = (x, y, x + win, y + win)
+                    crop = rgb.crop(box)
+                    if not self._region_is_informative(crop):
+                        x += step
+                        continue
+                    fp = build_emoji_fingerprint(crop)
+                    filename, score = self._best_asset_for_fingerprint(fp, crop)
+                    if filename and score >= 0.80:
+                        candidates.append((score, filename, box))
+                    x += step
+                y += step
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        picked: list[tuple[float, str, tuple[int, int, int, int]]] = []
+        used_names: set[str] = set()
+
+        for score, filename, box in candidates:
+            if filename in used_names:
+                continue
+            if any(self._box_iou(box, prev_box) > 0.32 for _, _, prev_box in picked):
+                continue
+            picked.append((score, filename, box))
+            used_names.add(filename)
+            if len(picked) >= max_regions:
+                break
+
+        return [(filename, score) for score, filename, _ in picked]
+
     async def detect_by_photo(self, image_bytes: bytes, top_k: int = 3) -> list[tuple[str, float]]:
-        if not self.asset_hashes:
+        if not self.asset_fingerprints:
             return []
 
         try:
             with Image.open(BytesIO(image_bytes)) as img:
-                query_hash = self._ahash(img)
+                rgb = img.convert("RGB")
+                whole_fp = build_emoji_fingerprint(rgb)
+                whole_name, whole_score = self._best_asset_for_fingerprint(whole_fp, rgb)
+                multi = self._detect_multi_candidates(rgb, max_regions=top_k)
         except OSError:
             return []
 
-        scored: list[tuple[str, float]] = []
-        for filename, h in self.asset_hashes.items():
-            dist = self._hamming(query_hash, h)
-            similarity = max(0.0, 1.0 - (dist / 64.0))
-            scored.append((filename, similarity))
+        results: list[tuple[str, float]] = []
+        if multi:
+            results.extend(multi)
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:top_k]
+        if whole_name and whole_score >= 0.82 and all(name != whole_name for name, _ in results):
+            results.append((whole_name, whole_score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        filtered = [(name, score) for name, score in results if score >= 0.82]
+        if len(filtered) >= 2:
+            best = filtered[0][1]
+            filtered = [item for item in filtered if (best - item[1]) <= 0.16]
+        return filtered[:top_k]
 
     async def send_random_vote(self, message: Message) -> None:
         if not self.assets:
@@ -716,6 +856,9 @@ async def on_inline_query(inline_query: InlineQuery) -> None:
             logging.warning("Inline query просрочен: %s", exc)
             return
         raise
+    except TelegramNetworkError as exc:
+        logging.warning("Сетевая ошибка при ответе на inline query: %s", exc)
+        return
 
 
 
@@ -843,7 +986,13 @@ async def on_photo_scan(message: Message) -> None:
         await message.bot.download_file(file.file_path, destination=tmp.name)
         data = Path(tmp.name).read_bytes()
 
-    matches = await service.detect_by_photo(data, top_k=3)
+    try:
+        matches = await service.detect_by_photo(data, top_k=3)
+    except Exception:  # noqa: BLE001
+        logging.exception("Ошибка распознавания эмодзи по фото")
+        await message.answer("Не удалось обработать фото. Попробуйте отправить другой скрин чуть крупнее.")
+        return
+
     if not matches:
         await message.answer("Не смог распознать эмодзи на фото.")
         return
